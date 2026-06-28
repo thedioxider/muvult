@@ -118,8 +118,10 @@ async def cmd_adduser(message: Message) -> None:
     Path(settings.music_root, username).mkdir(parents=True, exist_ok=True)
     try:
         library_id = await nd.create_library(username)
-        navidrome_user_id = await nd.get_user_id(username)
-        await nd.set_user_library(navidrome_user_id, library_id)
+        nd_user = await nd.get_user(username)
+        navidrome_user_id = nd_user["id"]
+        if not nd_user.get("isAdmin"):
+            await nd.set_user_library(navidrome_user_id, library_id)
     except httpx.HTTPError as e:
         await message.answer(f"Navidrome unreachable: {e}")
         return

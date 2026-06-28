@@ -46,11 +46,11 @@ class NavidromeClient:
     async def update_library(self, library_id: int, username: str) -> None:
         await self._request("PUT", f"/api/library/{library_id}", json={"name": username, "path": f"{self._music_path}/{username}"})
 
-    async def get_user_id(self, username: str) -> str:
+    async def get_user(self, username: str) -> dict:
         r = await self._request("GET", "/api/user")
         for u in r.json():
             if u.get("userName") == username:
-                return u["id"]
+                return u
         raise ValueError(f"Navidrome user not found: {username}")
 
     async def set_user_library(self, navidrome_user_id: str, library_id: int) -> None:
