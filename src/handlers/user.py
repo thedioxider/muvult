@@ -10,13 +10,37 @@ from ..db import User, get_session
 user_router = Router()
 
 
+_USER_HELP = (
+    "/help — this message\n"
+    "/start — welcome message\n"
+    "/settings — change confirmation mode\n"
+    "/id — show your Telegram ID\n\n"
+    "Send audio files to upload them to your library."
+)
+
+_ADMIN_SECTION = (
+    "\n\n*Admin:*\n"
+    "/adduser <tg\\_id> <username>\n"
+    "/removeuser <tg\\_id>\n"
+    "/settgid <username> <new\\_tg\\_id>\n"
+    "/setusername <old> <new>\n"
+    "/users"
+)
+
+
+@user_router.message(Command("help"))
+async def cmd_help(message: Message, is_admin: bool = False) -> None:
+    text = _USER_HELP + (_ADMIN_SECTION if is_admin else "")
+    await message.answer(text, parse_mode="Markdown")
+
+
 @user_router.message(Command("id"))
 async def cmd_id(message: Message) -> None:
     await message.answer(f"Your Telegram ID: `{message.from_user.id}`", parse_mode="Markdown")
 
 
 @user_router.message(Command("start"))
-async def cmd_start(message: Message) -> None:
+async def cmd_start(message: Message, is_admin: bool = False) -> None:
     tg_id = message.from_user.id
     async with get_session() as session:
         result = await session.exec(select(User).where(User.tg_id == tg_id))
@@ -27,6 +51,8 @@ async def cmd_start(message: Message) -> None:
             "Send me audio files to upload them to your music library.\n"
             "Use /settings to change confirmation mode."
         )
+    elif is_admin:
+        await message.answer("You don't have a user account yet. Use /adduser to add yourself.")
     else:
         await message.answer(
             f"You are not authorized. Ask an admin to add you.\n"

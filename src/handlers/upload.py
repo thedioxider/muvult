@@ -331,6 +331,7 @@ async def handle_audio(message: Message, bot: Bot) -> None:
         result = await session.exec(select(User).where(User.tg_id == tg_id))
         row = result.first()
     if not row:
+        await message.answer("You don't have a user account yet. Use /adduser to add yourself.")
         return
     user_id = row.id
 
