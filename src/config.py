@@ -32,6 +32,8 @@ class Settings(BaseSettings):
     def parse_ids(cls, v: Any) -> list[int]:
         if isinstance(v, str):
             return [int(x.strip()) for x in v.split(",") if x.strip()]
+        if isinstance(v, int):
+            return [v]
         return v
 
     @classmethod
