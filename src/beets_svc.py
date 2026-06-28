@@ -1,4 +1,5 @@
 import asyncio
+from asyncio import get_running_loop
 from pathlib import Path
 
 from beets import config as beets_config
@@ -23,7 +24,7 @@ def setup_beets(music_root: str) -> None:
 
 
 async def get_candidates(file_path: Path) -> TagResult:
-    loop = asyncio.get_event_loop()
+    loop = get_running_loop()
     return await loop.run_in_executor(None, _get_candidates_sync, file_path)
 
 
@@ -49,7 +50,7 @@ def _get_candidates_sync(file_path: Path) -> TagResult:
 
 
 async def apply_and_move(file_path: Path, candidate: Candidate) -> Path:
-    loop = asyncio.get_event_loop()
+    loop = get_running_loop()
     return await loop.run_in_executor(None, _apply_and_move_sync, file_path, candidate)
 
 
@@ -64,7 +65,7 @@ def _apply_and_move_sync(file_path: Path, candidate: Candidate) -> Path:
 
 
 async def move_as_is(file_path: Path) -> Path:
-    loop = asyncio.get_event_loop()
+    loop = get_running_loop()
     return await loop.run_in_executor(None, _move_as_is_sync, file_path)
 
 

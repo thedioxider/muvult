@@ -16,7 +16,7 @@ logging.basicConfig(level=logging.INFO)
 
 
 async def main() -> None:
-    await init_db(settings.db_path)
+    await init_db()
     setup_beets(settings.music_root)
 
     bot = Bot(token=settings.bot_token)

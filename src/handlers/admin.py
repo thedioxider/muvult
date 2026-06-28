@@ -1,8 +1,9 @@
 import shutil
 from pathlib import Path
+from typing import Any
 
 from aiogram import Router
-from aiogram.filters import Command
+from aiogram.filters import Command, Filter
 from aiogram.types import Message
 from sqlmodel import select
 
@@ -10,7 +11,14 @@ from ..db import Track, TrackOwnership, User, get_session
 from ..navidrome import NavidromeClient
 from ..pool import remove_pool_file, remove_symlink
 
+
+class _AdminOnly(Filter):
+    async def __call__(self, message: Message, is_admin: bool = False, **_: Any) -> bool:
+        return is_admin
+
+
 admin_router = Router()
+admin_router.message.filter(_AdminOnly())
 
 
 def _nd() -> NavidromeClient:

@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlmodel import Field, SQLModel
 from sqlmodel.ext.asyncio.session import AsyncSession
 
+_DB_PATH = "/data/muvult.db"
 _session_factory: async_sessionmaker | None = None
 
 
@@ -37,7 +38,7 @@ class TrackOwnership(SQLModel, table=True):
     symlink_path: str
 
 
-async def init_db(db_path: str) -> None:
+async def init_db(db_path: str = _DB_PATH) -> None:
     global _session_factory
     engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
     _session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)

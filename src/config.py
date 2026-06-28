@@ -26,7 +26,6 @@ class Settings(BaseSettings):
 
     music_root: str = "/music"
     staging_root: str = "/staging"
-    db_path: str = "/data/muvult.db"
 
     @field_validator("admin_tg_ids", mode="before")
     @classmethod

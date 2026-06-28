@@ -1,4 +1,5 @@
 import asyncio
+from asyncio import get_running_loop
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -14,6 +15,8 @@ from ..pool import create_symlink, remove_symlink, remove_pool_file, update_syml
 from ..quality import is_better
 
 upload_router = Router()
+
+_CB_SEP = "\x1f"
 
 _confirmation_queues: dict[int, asyncio.Queue] = {}
 _confirmation_active: dict[int, bool] = {}
@@ -86,8 +89,8 @@ async def _ask_confirmation(bot: Bot, tg_id: int, req: "_ConfirmationRequest") -
     tag = req.tag_result
     if not tag.candidates:
         buttons = [[
-            InlineKeyboardButton(text="Import as-is", callback_data=f"conf:{req.filename}:asis"),
-            InlineKeyboardButton(text="Skip", callback_data=f"conf:{req.filename}:skip"),
+            InlineKeyboardButton(text="Import as-is", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}asis"),
+            InlineKeyboardButton(text="Skip", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}skip"),
         ]]
         text = f"No matches found for *{req.filename}*"
     elif tag.recommendation >= 3:
@@ -98,9 +101,9 @@ async def _ask_confirmation(bot: Bot, tg_id: int, req: "_ConfirmationRequest") -
             f"Confidence: {(1 - c.distance) * 100:.0f}%"
         )
         buttons = [[
-            InlineKeyboardButton(text="Import", callback_data=f"conf:{req.filename}:0"),
-            InlineKeyboardButton(text="See others", callback_data=f"conf:{req.filename}:list"),
-            InlineKeyboardButton(text="Skip", callback_data=f"conf:{req.filename}:skip"),
+            InlineKeyboardButton(text="Import", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}0"),
+            InlineKeyboardButton(text="See others", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}list"),
+            InlineKeyboardButton(text="Skip", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}skip"),
         ]]
     else:
         text = f"Low confidence matches for *{req.filename}*:"
@@ -108,11 +111,11 @@ async def _ask_confirmation(bot: Bot, tg_id: int, req: "_ConfirmationRequest") -
         for c in tag.candidates:
             rows.append([InlineKeyboardButton(
                 text=f"{c.artist} — {c.title} ({(1 - c.distance) * 100:.0f}%)",
-                callback_data=f"conf:{req.filename}:{c.index}",
+                callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}{c.index}",
             )])
         rows.append([
-            InlineKeyboardButton(text="Import as-is", callback_data=f"conf:{req.filename}:asis"),
-            InlineKeyboardButton(text="Skip", callback_data=f"conf:{req.filename}:skip"),
+            InlineKeyboardButton(text="Import as-is", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}asis"),
+            InlineKeyboardButton(text="Skip", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}skip"),
         ])
         buttons = rows
 
@@ -156,13 +159,14 @@ async def _process_file(
 
         if mode == ConfirmationMode.OFF:
             chosen_index = 0 if (is_high and tag_result.candidates) else "asis"
-        elif mode == ConfirmationMode.AUTO:
-            if is_high and tag_result.candidates:
-                chosen_index = 0
-            else:
-                chosen_index = await _queue_confirmation(bot, tg_id, filename, tag_result, file_path, states, status_chat_id, status_msg_id)
+        elif mode == ConfirmationMode.AUTO and is_high and tag_result.candidates:
+            chosen_index = 0
         else:
-            chosen_index = await _queue_confirmation(bot, tg_id, filename, tag_result, file_path, states, status_chat_id, status_msg_id)
+            while True:
+                chosen_index = await _queue_confirmation(bot, tg_id, filename, tag_result, file_path, states, status_chat_id, status_msg_id)
+                if chosen_index != "list":
+                    break
+                tag_result.recommendation = 0
 
         if chosen_index is None:
             states[filename] = FileState(filename, FileStatus.SKIPPED)
@@ -255,8 +259,7 @@ async def _queue_confirmation(
     status_chat_id: int,
     status_msg_id: int,
 ) -> int | str | None:
-    loop = asyncio.get_event_loop()
-    future: asyncio.Future = loop.create_future()
+    future: asyncio.Future = get_running_loop().create_future()
 
     req = _ConfirmationRequest(filename=filename, tag_result=tag_result, file_path=file_path, future=future)
 
@@ -284,9 +287,9 @@ async def _drain_confirmation_queue(bot: Bot, tg_id: int) -> None:
     _confirmation_active[tg_id] = False
 
 
-@upload_router.callback_query(lambda c: c.data and c.data.startswith("conf:"))
+@upload_router.callback_query(lambda c: c.data and c.data.startswith(f"conf{_CB_SEP}"))
 async def cb_confirmation(callback: CallbackQuery, bot: Bot) -> None:
-    _, filename, choice = callback.data.split(":", 2)
+    _, filename, choice = callback.data.split(_CB_SEP, 2)
     tg_id = callback.from_user.id
 
     q = _confirmation_queues.get(tg_id)
@@ -298,7 +301,6 @@ async def cb_confirmation(callback: CallbackQuery, bot: Bot) -> None:
     while not q.empty():
         pending.append(q.get_nowait())
 
-    resolved = False
     for req in pending:
         if req.filename == filename and not req.future.done():
             if choice == "skip":
@@ -309,22 +311,11 @@ async def cb_confirmation(callback: CallbackQuery, bot: Bot) -> None:
                 req.future.set_result("list")
             else:
                 req.future.set_result(int(choice))
-            resolved = True
         else:
             await q.put(req)
 
     await callback.message.delete()
     await callback.answer()
-
-    if resolved and choice == "list":
-        q2 = _confirmation_queues.get(tg_id)
-        for req in pending:
-            if req.filename == filename:
-                req.tag_result.recommendation = 0
-                new_future: asyncio.Future = asyncio.get_event_loop().create_future()
-                new_req = _ConfirmationRequest(req.filename, req.tag_result, req.file_path, new_future)
-                await q2.put(new_req)
-                asyncio.create_task(_drain_confirmation_queue(bot, tg_id))
 
 
 @upload_router.message(lambda m: m.audio or m.document)
@@ -334,7 +325,7 @@ async def handle_audio(message: Message, bot: Bot) -> None:
     tg_id = message.from_user.id
 
     audio = message.audio or message.document
-    filename = getattr(audio, "file_name", None) or f"{audio.file_id}.audio"
+    filename = Path(getattr(audio, "file_name", None) or f"{audio.file_id}.audio").name
 
     async with get_session() as session:
         result = await session.exec(select(User).where(User.tg_id == tg_id))
