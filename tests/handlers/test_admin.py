@@ -1,0 +1,77 @@
+import pytest
+from contextlib import asynccontextmanager
+from unittest.mock import AsyncMock, MagicMock, patch
+from src.handlers.admin import cmd_adduser, cmd_users, cmd_settgid
+
+
+def _msg(text: str, tg_id: int = 1):
+    msg = AsyncMock()
+    msg.from_user = MagicMock(id=tg_id)
+    msg.text = text
+    return msg
+
+
+def _mock_session(exec_return=None):
+    session = AsyncMock()
+    result = MagicMock()
+    result.first.return_value = exec_return
+    result.all.return_value = exec_return or []
+    session.exec = AsyncMock(return_value=result)
+    session.add = MagicMock()
+    session.commit = AsyncMock()
+    session.delete = AsyncMock()
+
+    @asynccontextmanager
+    async def _ctx():
+        yield session
+
+    return _ctx, session
+
+
+@pytest.mark.asyncio
+async def test_adduser_success():
+    msg = _msg("/adduser 99999 alice")
+    ctx, session = _mock_session()
+
+    mock_settings = MagicMock()
+    mock_settings.music_root = "/music"
+    mock_settings.nd_url = "http://nd.test"
+    mock_settings.nd_admin_user = "admin"
+    mock_settings.nd_admin_pass = "secret"
+    mock_settings.nd_music_path = "/muvult"
+
+    with (
+        patch("src.handlers.admin.get_session", ctx),
+        patch("src.handlers.admin.NavidromeClient") as MockND,
+        patch("src.handlers.admin.Path.mkdir"),
+        patch("src.config.settings", mock_settings),
+    ):
+        nd = AsyncMock()
+        nd.create_library = AsyncMock(return_value=5)
+        nd.get_user_id = AsyncMock(return_value="nd-uid-alice")
+        nd.set_user_library = AsyncMock()
+        MockND.return_value = nd
+
+        await cmd_adduser(msg)
+
+    session.add.assert_called_once()
+    session.commit.assert_called_once()
+    assert "alice" in msg.answer.call_args[0][0]
+
+
+@pytest.mark.asyncio
+async def test_adduser_wrong_args():
+    msg = _msg("/adduser onlyonearg")
+    await cmd_adduser(msg)
+    assert "Usage" in msg.answer.call_args[0][0]
+
+
+@pytest.mark.asyncio
+async def test_users_empty():
+    msg = _msg("/users")
+    ctx, _ = _mock_session(exec_return=[])
+
+    with patch("src.handlers.admin.get_session", ctx):
+        await cmd_users(msg)
+
+    assert "No users" in msg.answer.call_args[0][0]

@@ -40,4 +40,13 @@ class Settings(BaseSettings):
         return (init_settings, _CommaSplitEnvSource(settings_cls), dotenv_settings)
 
 
-settings = Settings()
+class _LazySettings:
+    _instance: "Settings | None" = None
+
+    def __getattr__(self, name: str) -> Any:
+        if self._instance is None:
+            self._instance = Settings()
+        return getattr(self._instance, name)
+
+
+settings: Settings = _LazySettings()  # type: ignore[assignment]
