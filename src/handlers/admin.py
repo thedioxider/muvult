@@ -25,14 +25,20 @@ admin_router.message.filter(_AdminOnly())
 admin_router.callback_query.filter(_AdminOnly())
 
 
+_nd_client: NavidromeClient | None = None
+
+
 def _nd() -> NavidromeClient:
-    from ..config import settings
-    return NavidromeClient(
-        base_url=settings.nd_url,
-        user=settings.nd_admin_user,
-        password=settings.nd_admin_pass,
-        music_path=settings.nd_music_path,
-    )
+    global _nd_client
+    if _nd_client is None:
+        from ..config import settings
+        _nd_client = NavidromeClient(
+            base_url=settings.nd_url,
+            user=settings.nd_admin_user,
+            password=settings.nd_admin_pass,
+            music_path=settings.nd_music_path,
+        )
+    return _nd_client
 
 
 def _nd_err_keyboard(action: str) -> InlineKeyboardMarkup:
