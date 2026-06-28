@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "muvult"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "aiogram>=3.15",
+    "sqlmodel>=0.0.22",
+    "aiosqlite>=0.21",
+    "httpx>=0.28",
+    "beets>=2.3",
+    "pydantic-settings>=2.8",
+    "musicbrainzngs>=0.7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.25",
+    "pytest-mock>=3.14",
+    "respx>=0.22",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

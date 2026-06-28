@@ -1,0 +1,12 @@
+services:
+  muvult:
+    build: .
+    container_name: muvult
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - /data/media/muvult:/music
+      - /data/var/muvult:/data
+      - /tmp/muvult:/staging
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
