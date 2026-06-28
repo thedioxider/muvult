@@ -23,7 +23,7 @@ class NavidromeClient:
             r.raise_for_status()
             self._token = r.json()["token"]
             self._token_ts = time.monotonic()
-        return {"Authorization": f"Bearer {self._token}"}
+        return {"X-ND-Authorization": f"Bearer {self._token}"}
 
     async def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
         headers = await self._auth_header()
