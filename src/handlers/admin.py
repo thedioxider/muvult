@@ -16,7 +16,7 @@ _ND_SEP = "\x1f"
 
 
 class _AdminOnly(Filter):
-    async def __call__(self, is_admin: bool = False, **_: Any) -> bool:
+    async def __call__(self, _ev: Any, is_admin: bool = False, **_kw: Any) -> bool:
         return is_admin
 
 
