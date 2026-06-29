@@ -291,7 +291,7 @@ async def cmd_recreatelinks(message: Message) -> None:
     target = username or "all users"
     msg = f"Recreated {count} symlink(s) for {target}"
     if missing:
-        msg += "\n\nMissing pool files:\n" + "\n".join(f"  — <i>{p}</i>" for p in missing)
+        msg += "\n\nMissing pool files:\n" + "\n".join(f"— <i>{p}</i>" for p in missing)
     await message.answer(msg, parse_mode="HTML")
 
 
@@ -333,8 +333,8 @@ async def cmd_users(message: Message) -> None:
         rows = result.all()
 
     if not rows:
-        await message.answer("No users.")
+        await message.answer("No users")
         return
 
-    lines = [f"• {u.username} (tg_id={u.tg_id})" for u in rows]
+    lines = [f"— {u.username} (tg_id={u.tg_id})" for u in rows]
     await message.answer("Users:\n" + "\n".join(lines))

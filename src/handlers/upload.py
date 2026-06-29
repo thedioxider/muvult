@@ -70,7 +70,7 @@ def _format_status_message(states: dict[str, FileState]) -> str:
         lines.append(f"<b>{icon} {label}</b> ({len(files)}):")
         for f in files:
             note = f" ~ {f.note}" if f.note else ""
-            lines.append(f"  — <i>{f.original_name}</i>{note}")
+            lines.append(f"— <i>{f.original_name}</i>{note}")
     return "\n".join(lines) or "⏳ Processing..."
 
 
