@@ -1,4 +1,5 @@
 import secrets
+import shlex
 import shutil
 from pathlib import Path
 from typing import Any
@@ -367,23 +368,26 @@ async def cb_pool_delete(callback: CallbackQuery) -> None:
 
 @admin_router.message(Command("removetrack"))
 async def cmd_removetrack(message: Message) -> None:
-    tokens = (message.text or "").split()
-    if len(tokens) < 2:
+    try:
+        args = shlex.split((message.text or "").split(" ", 1)[1] if " " in (message.text or "") else "")
+    except ValueError:
+        await message.answer("Invalid syntax (unclosed quote?)")
+        return
+    if not args:
         await message.answer("Usage: /removetrack <path> [username]")
         return
 
-    text = " ".join(tokens[1:])
+    rel_path = args[0]
     username: str | None = None
     target_user_id: int | None = None
 
-    if " " in text:
-        path_try, _, user_try = text.rpartition(" ")
+    if len(args) >= 2:
         async with get_session() as session:
-            u = (await session.exec(select(User).where(User.username == user_try))).first()
-        if u:
-            text, username, target_user_id = path_try, user_try, u.id
-
-    rel_path = text
+            u = (await session.exec(select(User).where(User.username == args[1]))).first()
+        if not u:
+            await message.answer(f"No user: {args[1]}")
+            return
+        username, target_user_id = args[1], u.id
     from ..config import settings
     pool_root = Path(settings.music_root) / ".pool"
     prefix = _parse_wildcard_prefix(rel_path)
