@@ -179,6 +179,8 @@ async def _process_file(
         if chosen_index is None:
             states[filename] = FileState(filename, FileStatus.SKIPPED)
             await _edit_status(bot, status_chat_id, status_msg_id, states)
+            if file_path.exists():
+                file_path.unlink()
             return
 
         if chosen_index == "asis":
