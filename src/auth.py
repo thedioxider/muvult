@@ -38,4 +38,12 @@ class AuthMiddleware(BaseMiddleware):
             data["is_admin"] = False
             return await handler(event, data)
 
+        from aiogram.types import Update
+        if isinstance(event, Update) and event.message:
+            text = event.message.text or ""
+            cmd = text.split()[0].split("@")[0] if text.startswith("/") else ""
+            if cmd in ("/start", "/id"):
+                data["is_admin"] = False
+                return await handler(event, data)
+
         # Silently ignore unauthorized
