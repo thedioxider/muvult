@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 from asyncio import get_running_loop
 from pathlib import Path
 
@@ -12,6 +13,8 @@ from .models import Candidate, TagResult
 
 _BEETS_DB = "/data/beets_pool.db"
 _lib: Library | None = None
+
+_FEAT_RE = re.compile(r"\s*[\(\[]?\s*(?:feat\.?|ft\.?|with)\s+[^\)\]]+[\)\]]?", re.IGNORECASE)
 
 
 def setup_beets(music_root: str) -> None:
@@ -36,6 +39,8 @@ async def get_candidates(file_path: Path) -> TagResult:
 
 def _get_candidates_sync(file_path: Path) -> TagResult:
     item = Item.from_path(str(file_path))
+    if item.title:
+        item.title = _FEAT_RE.sub("", item.title).strip()
     proposal = tag_item(item)
     candidates = []
     for i, match in enumerate(proposal.candidates[:6]):
