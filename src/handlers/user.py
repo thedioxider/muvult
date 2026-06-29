@@ -19,24 +19,26 @@ _USER_HELP = (
 )
 
 _ADMIN_SECTION = (
-    "\n\n**Admin:**\n"
-    "/adduser <username> <tg\\_id>\n"
-    "/removeuser <username>\n"
-    "/settgid <username> <new\\_tg\\_id>\n"
-    "/setusername <old> <new>\n"
-    "/users"
+    "\n\n<b>Admin:</b>\n"
+    "/adduser [username] [tg_id]\n"
+    "/removeuser [username]\n"
+    "/settgid [username] [new_tg_id]\n"
+    "/setusername [old] [new]\n"
+    "/users\n"
+    "/recreatelinks [username]\n"
+    "/removetrack [pool-relative-path]"
 )
 
 
 @user_router.message(Command("help"))
 async def cmd_help(message: Message, is_admin: bool = False) -> None:
     text = _USER_HELP + (_ADMIN_SECTION if is_admin else "")
-    await message.answer(text, parse_mode="Markdown")
+    await message.answer(text, parse_mode="HTML")
 
 
 @user_router.message(Command("id"))
 async def cmd_id(message: Message) -> None:
-    await message.answer(f"Your Telegram ID: `{message.from_user.id}`", parse_mode="Markdown")
+    await message.answer(f"Your Telegram ID: <code>{message.from_user.id}</code>", parse_mode="HTML")
 
 
 @user_router.message(Command("start"))
@@ -112,5 +114,5 @@ async def cb_set_confirmation(callback: CallbackQuery) -> None:
         row.settings = json.dumps(s)
         await session.commit()
 
-    await callback.message.edit_text(f"Confirmation mode set to: **{mode}**", parse_mode="Markdown")
+    await callback.message.edit_text(f"Confirmation mode set to: <b>{mode}</b>", parse_mode="HTML")
     await callback.answer()

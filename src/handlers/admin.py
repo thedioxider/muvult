@@ -10,7 +10,7 @@ from sqlmodel import select
 
 from ..db import Track, TrackOwnership, User, get_session
 from ..navidrome import NavidromeClient
-from ..pool import remove_pool_file, remove_symlink
+from ..pool import create_symlink, remove_pool_file, remove_symlink
 
 _ND_SEP = "\x1f"
 
@@ -50,6 +50,7 @@ def _nd_err_keyboard(action: str) -> InlineKeyboardMarkup:
 
 async def _local_remove(tg_id: int) -> str | None:
     from ..config import settings
+    pool_root = Path(settings.music_root) / ".pool"
     async with get_session() as session:
         result = await session.exec(select(User).where(User.tg_id == tg_id))
         user = result.first()
@@ -68,7 +69,7 @@ async def _local_remove(tg_id: int) -> str | None:
                 .where(TrackOwnership.track_id == track.id, TrackOwnership.user_id != user.id)
             )
             if not other.first():
-                remove_pool_file(Path(track.pool_path))
+                remove_pool_file(pool_root / track.pool_path)
                 await session.delete(track)
 
         username = user.username
@@ -245,6 +246,84 @@ async def cb_nd_skip(callback: CallbackQuery) -> None:
         await callback.message.edit_text(f"Renamed {old} → {new} (Navidrome library not updated).")
 
     await callback.answer()
+
+
+@admin_router.message(Command("recreatelinks"))
+async def cmd_recreatelinks(message: Message) -> None:
+    parts = (message.text or "").split()
+    username = parts[1] if len(parts) > 1 else None
+
+    from ..config import settings
+    pool_root = Path(settings.music_root) / ".pool"
+
+    async with get_session() as session:
+        if username:
+            result = await session.exec(select(User).where(User.username == username))
+            users = [result.first()]
+            if not users[0]:
+                await message.answer(f"No user: {username}")
+                return
+        else:
+            result = await session.exec(select(User))
+            users = result.all()
+
+        count = 0
+        missing = []
+        for user in users:
+            user_dir = Path(settings.music_root) / user.username
+            own_result = await session.exec(
+                select(TrackOwnership, Track)
+                .join(Track, Track.id == TrackOwnership.track_id)
+                .where(TrackOwnership.user_id == user.id)
+            )
+            for ownership, track in own_result.all():
+                pool_file = pool_root / track.pool_path
+                if not pool_file.exists():
+                    missing.append(track.pool_path)
+                    continue
+                remove_symlink(Path(ownership.symlink_path))
+                new_link = create_symlink(pool_file, user_dir)
+                ownership.symlink_path = str(new_link)
+                count += 1
+
+        await session.commit()
+
+    target = username or "all users"
+    msg = f"Recreated {count} symlink(s) for {target}"
+    if missing:
+        msg += "\n\nMissing pool files:\n" + "\n".join(f"  — <i>{p}</i>" for p in missing)
+    await message.answer(msg, parse_mode="HTML")
+
+
+@admin_router.message(Command("removetrack"))
+async def cmd_removetrack(message: Message) -> None:
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) != 2:
+        await message.answer("Usage: /removetrack <path-relative-to-pool>")
+        return
+
+    rel_path = parts[1].strip()
+    from ..config import settings
+    pool_root = Path(settings.music_root) / ".pool"
+
+    async with get_session() as session:
+        result = await session.exec(select(Track).where(Track.pool_path == rel_path))
+        track = result.first()
+        if not track:
+            await message.answer(f"Track not found: {rel_path}")
+            return
+
+        own_result = await session.exec(
+            select(TrackOwnership).where(TrackOwnership.track_id == track.id)
+        )
+        for ownership in own_result.all():
+            remove_symlink(Path(ownership.symlink_path))
+
+        remove_pool_file(pool_root / track.pool_path)
+        await session.delete(track)
+        await session.commit()
+
+    await message.answer(f"Removed: {rel_path}")
 
 
 @admin_router.message(Command("users"))

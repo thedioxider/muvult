@@ -1,15 +1,23 @@
+import os
 from pathlib import Path
 
 
-def create_symlink(pool_file: Path, user_dir: Path) -> Path:
-    pool_root = pool_file.parent
-    while pool_root.name != ".pool":
-        pool_root = pool_root.parent
+def _pool_root(pool_file: Path) -> Path:
+    root = pool_file.parent
+    while root.name != ".pool":
+        root = root.parent
+    return root
 
-    relative = pool_file.relative_to(pool_root)
+
+def pool_rel(pool_file: Path) -> str:
+    return str(pool_file.relative_to(_pool_root(pool_file)))
+
+
+def create_symlink(pool_file: Path, user_dir: Path) -> Path:
+    relative = pool_file.relative_to(_pool_root(pool_file))
     link_path = user_dir / relative
     link_path.parent.mkdir(parents=True, exist_ok=True)
-    link_path.symlink_to(pool_file.resolve())
+    link_path.symlink_to(os.path.relpath(pool_file, link_path.parent))
     return link_path
 
 
@@ -34,11 +42,7 @@ def update_symlinks(old_pool: Path, new_pool: Path, symlink_paths: list[Path]) -
 
 
 def _find_user_dir(link: Path, pool_file: Path) -> Path:
-    pool_root = pool_file.parent
-    while pool_root.name != ".pool":
-        pool_root = pool_root.parent
-
-    relative = pool_file.relative_to(pool_root)
+    relative = pool_file.relative_to(_pool_root(pool_file))
     parts_count = len(relative.parts)
     user_dir = link
     for _ in range(parts_count):

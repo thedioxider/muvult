@@ -1,5 +1,6 @@
 import asyncio
 from asyncio import get_running_loop
+import html
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,7 +12,7 @@ from sqlmodel import select
 from ..beets_svc import get_candidates, apply_and_move, move_as_is
 from ..db import Track, TrackOwnership, User, get_session
 from ..models import ConfirmationMode, FileStatus, TagResult
-from ..pool import create_symlink, remove_pool_file, update_symlinks
+from ..pool import create_symlink, pool_rel, remove_pool_file, update_symlinks
 from ..quality import is_better
 
 upload_router = Router()
@@ -90,18 +91,22 @@ async def _edit_status(bot: Bot, chat_id: int, msg_id: int, states: dict[str, Fi
 
 async def _ask_confirmation(bot: Bot, tg_id: int, req: "_ConfirmationRequest") -> None:
     tag = req.tag_result
+    fname = html.escape(req.filename)
     if not tag.candidates:
         buttons = [[
             InlineKeyboardButton(text="Import as-is", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}asis"),
             InlineKeyboardButton(text="Skip", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}skip"),
         ]]
-        text = f"❌ No matches found for:\n*{req.filename}*"
+        text = f"❌ No matches found for:\n<b>{fname}</b>"
     elif tag.recommendation >= 3:
         c = tag.candidates[0]
+        artist = html.escape(c.artist)
+        title = html.escape(c.title)
+        album = html.escape(c.album)
         text = (
-            f"❓ *{req.filename}*\n\n"
-            f"Match: *{c.artist} — {c.title}* ({c.album}, {c.year})\n"
-            f"Confidence: *{(1 - c.distance) * 100:.0f}%*"
+            f"❓ <b>{fname}</b>\n\n"
+            f"Match: <b>{artist} — {title}</b> ({album}, {c.year})\n"
+            f"Confidence: <b>{(1 - c.distance) * 100:.0f}%</b>"
         )
         buttons = [[
             InlineKeyboardButton(text="Import", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}0"),
@@ -109,10 +114,13 @@ async def _ask_confirmation(bot: Bot, tg_id: int, req: "_ConfirmationRequest") -
             InlineKeyboardButton(text="Skip", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}skip"),
         ]]
     else:
-        text = f"❓ Matches for:\n*{req.filename}*:"
+        text = f"❓ Matches for:\n<b>{fname}</b>:\n"
         rows = []
         for i, c in enumerate(tag.candidates[:6]):
-            text += f"{i}. *{c.artist} — {c.title}* ({c.album}, {c.year})\n"
+            artist = html.escape(c.artist)
+            title = html.escape(c.title)
+            album = html.escape(c.album)
+            text += f"{i}. <b>{artist} — {title}</b> ({album}, {c.year})\n"
             new_button = InlineKeyboardButton(
                     text=f"#{i} ({(1 - c.distance) * 100:.0f}%)",
                     callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}{c.index}",
@@ -127,7 +135,7 @@ async def _ask_confirmation(bot: Bot, tg_id: int, req: "_ConfirmationRequest") -
         ])
         buttons = rows
 
-    await bot.send_message(tg_id, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="Markdown")
+    await bot.send_message(tg_id, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
 
 
 async def _process_file(
@@ -200,11 +208,12 @@ async def _process_file(
             new_bitrate, new_format = 0, pool_file.suffix.lstrip(".")
 
         note = ""
+        pool_root = Path(settings.music_root) / ".pool"
         async with get_session() as session:
             if mb_id:
                 result = await session.exec(select(Track).where(Track.musicbrainz_id == mb_id))
             else:
-                result = await session.exec(select(Track).where(Track.pool_path == str(pool_file)))
+                result = await session.exec(select(Track).where(Track.pool_path == pool_rel(pool_file)))
             existing = result.first()
 
             if existing:
@@ -214,10 +223,10 @@ async def _process_file(
                     )
                     ownerships = own_result.all()
                     old_links = [Path(o.symlink_path) for o in ownerships]
-                    new_links = update_symlinks(Path(existing.pool_path), pool_file, old_links)
-                    remove_pool_file(Path(existing.pool_path))
+                    new_links = update_symlinks(pool_root / existing.pool_path, pool_file, old_links)
+                    remove_pool_file(pool_root / existing.pool_path)
                     note = f"replaced {existing.format.upper()} {existing.bitrate}kbps"
-                    existing.pool_path = str(pool_file)
+                    existing.pool_path = pool_rel(pool_file)
                     existing.bitrate = new_bitrate
                     existing.format = new_format
                     for ownership, new_l in zip(ownerships, new_links):
@@ -231,7 +240,7 @@ async def _process_file(
                     return
             else:
                 track = Track(
-                    pool_path=str(pool_file), musicbrainz_id=mb_id,
+                    pool_path=pool_rel(pool_file), musicbrainz_id=mb_id,
                     format=new_format, bitrate=new_bitrate,
                 )
                 session.add(track)

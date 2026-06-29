@@ -63,6 +63,9 @@ def _apply_and_move_sync(file_path: Path, candidate: Candidate) -> Path:
     item = match.item
     item.write(path=str(file_path))
     item.add(_lib)
+    dest = Path(os.fsdecode(item.destination()))
+    if dest.exists():
+        dest.unlink()
     item.move(store=True)
     return Path(os.fsdecode(item.path))
 
@@ -75,5 +78,8 @@ async def move_as_is(file_path: Path) -> Path:
 def _move_as_is_sync(file_path: Path) -> Path:
     item = Item.from_path(str(file_path))
     item.add(_lib)
+    dest = Path(os.fsdecode(item.destination()))
+    if dest.exists():
+        dest.unlink()
     item.move(store=True)
     return Path(os.fsdecode(item.path))
