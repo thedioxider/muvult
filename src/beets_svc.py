@@ -21,6 +21,8 @@ def setup_beets(music_root: str) -> None:
     beets_config["plugins"].set(["musicbrainz"])
     beets_config["musicbrainz"]["searchlimit"].set(10)
     plugins.load_plugins()
+    from .beets_patches import patch_mb_phrase_search
+    patch_mb_phrase_search()
     beets_config["asciify_paths"].set(True)
     beets_config["paths"]["default"].set("$albumartist/$album/$track - $title")
     beets_config["paths"]["singleton"].set("$albumartist/$album/$track - $title")
