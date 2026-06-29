@@ -14,6 +14,8 @@ _lib: Library | None = None
 
 
 def setup_beets(music_root: str) -> None:
+    import logging
+    logging.getLogger("beets").setLevel(logging.DEBUG)
     global _lib
     pool_path = str(Path(music_root) / ".pool")
     beets_config.read(user=False, defaults=True)
@@ -29,8 +31,16 @@ async def get_candidates(file_path: Path) -> TagResult:
 
 
 def _get_candidates_sync(file_path: Path) -> TagResult:
+    import logging
+    log = logging.getLogger(__name__)
     item = Item.from_path(str(file_path))
-    proposal = tag_item(item)
+    log.info("tagging %s: artist=%r title=%r album=%r", file_path.name, item.artist, item.title, item.album)
+    try:
+        proposal = tag_item(item)
+    except Exception as e:
+        log.exception("tag_item failed: %s", e)
+        raise
+    log.info("proposal: recommendation=%s candidates=%d", proposal.recommendation, len(proposal.candidates))
     candidates = []
     for i, match in enumerate(proposal.candidates[:6]):
         info = match.info
