@@ -101,15 +101,15 @@ async def _ask_confirmation(bot: Bot, tg_id: int, req: "_ConfirmationRequest") -
             InlineKeyboardButton(text="Import as-is", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}asis"),
             InlineKeyboardButton(text="Skip", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}skip"),
         ]]
-        text = f"❌ No matches found for:\n<b>{fname}</b>"
+        text = f"❌ No matches found for:\n<i>{fname}</i>"
     elif tag.recommendation >= 3:
         c = tag.candidates[0]
         artist = html.escape(c.artist)
         title = html.escape(c.title)
         album = html.escape(c.album)
         text = (
-            f"❓ <b>{fname}</b>\n\n"
-            f"Match: <b>{artist} — {title}</b> ({album}, {c.year})\n"
+            f"❓ <i>{fname}</i>\n\n"
+            f"Match: <i>{artist} — {title}</i> ({album}, {c.year})\n"
             f"Confidence: <b>{(1 - c.distance) * 100:.0f}%</b>"
         )
         buttons = [[
@@ -118,13 +118,13 @@ async def _ask_confirmation(bot: Bot, tg_id: int, req: "_ConfirmationRequest") -
             InlineKeyboardButton(text="Skip", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}skip"),
         ]]
     else:
-        text = f"❓ Matches for:\n<b>{fname}</b>:\n"
+        text = f"❓ Matches for:\n<i>{fname}</i>:\n"
         rows = []
         for i, c in enumerate(tag.candidates[:6]):
             artist = html.escape(c.artist)
             title = html.escape(c.title)
             album = html.escape(c.album)
-            text += f"{i + 1}. <b>{artist} — {title}</b> ({album}, {c.year})\n"
+            text += f"{i + 1}. <i>{artist} — {title}</i> ({album}, {c.year})\n"
             new_button = InlineKeyboardButton(
                     text=f"#{i + 1} ({(1 - c.distance) * 100:.0f}%)",
                     callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}{c.index}",
