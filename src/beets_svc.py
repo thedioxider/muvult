@@ -21,6 +21,7 @@ def setup_beets(music_root: str) -> None:
     beets_config["plugins"].set(["musicbrainz"])
     beets_config["musicbrainz"]["searchlimit"].set(10)
     plugins.load_plugins()
+    beets_config["asciify_paths"].set(True)
     beets_config["paths"]["default"].set("$albumartist/$album/$track - $title")
     beets_config["paths"]["singleton"].set("$albumartist/$album/$track - $title")
     _lib = Library(_BEETS_DB, directory=pool_path)
