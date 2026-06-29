@@ -2,7 +2,7 @@ import asyncio
 from asyncio import get_running_loop
 from pathlib import Path
 
-from beets import config as beets_config
+from beets import config as beets_config, plugins
 from beets.autotag.match import tag_item
 from beets.library import Library
 from beets.library.models import Item
@@ -14,12 +14,12 @@ _lib: Library | None = None
 
 
 def setup_beets(music_root: str) -> None:
-    import logging
-    logging.getLogger("beets").setLevel(logging.DEBUG)
     global _lib
     pool_path = str(Path(music_root) / ".pool")
     beets_config.read(user=False, defaults=True)
+    beets_config["plugins"].set(["musicbrainz"])
     beets_config["musicbrainz"]["searchlimit"].set(10)
+    plugins.load_plugins()
     beets_config["paths"]["default"].set("$albumartist/$album/$track - $title")
     beets_config["paths"]["singleton"].set("$albumartist/$album/$track - $title")
     _lib = Library(_BEETS_DB, directory=pool_path)
@@ -31,16 +31,8 @@ async def get_candidates(file_path: Path) -> TagResult:
 
 
 def _get_candidates_sync(file_path: Path) -> TagResult:
-    import logging
-    log = logging.getLogger(__name__)
     item = Item.from_path(str(file_path))
-    log.info("tagging %s: artist=%r title=%r album=%r", file_path.name, item.artist, item.title, item.album)
-    try:
-        proposal = tag_item(item)
-    except Exception as e:
-        log.exception("tag_item failed: %s", e)
-        raise
-    log.info("proposal: recommendation=%s candidates=%d", proposal.recommendation, len(proposal.candidates))
+    proposal = tag_item(item)
     candidates = []
     for i, match in enumerate(proposal.candidates[:6]):
         info = match.info
