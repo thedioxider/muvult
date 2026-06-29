@@ -20,6 +20,7 @@ _CB_SEP = "\x1f"
 
 _confirmation_queues: dict[int, asyncio.Queue] = {}
 _confirmation_active: dict[int, bool] = {}
+_active_confirmations: dict[int, "_ConfirmationRequest"] = {}
 
 _STATUS_ICONS = {
     FileStatus.DOWNLOADING: "📥",
@@ -282,8 +283,10 @@ async def _drain_confirmation_queue(bot: Bot, tg_id: int) -> None:
     while q and not q.empty():
         req: _ConfirmationRequest = await q.get()
         if not req.future.done():
+            _active_confirmations[tg_id] = req
             await _ask_confirmation(bot, tg_id, req)
             await req.future
+            _active_confirmations.pop(tg_id, None)
     _confirmation_active[tg_id] = False
 
 
@@ -292,27 +295,19 @@ async def cb_confirmation(callback: CallbackQuery, bot: Bot) -> None:
     _, filename, choice = callback.data.split(_CB_SEP, 2)
     tg_id = callback.from_user.id
 
-    q = _confirmation_queues.get(tg_id)
-    if not q:
+    req = _active_confirmations.get(tg_id)
+    if not req or req.filename != filename or req.future.done():
         await callback.answer("No pending confirmation")
         return
 
-    pending: list[_ConfirmationRequest] = []
-    while not q.empty():
-        pending.append(q.get_nowait())
-
-    for req in pending:
-        if req.filename == filename and not req.future.done():
-            if choice == "skip":
-                req.future.set_result(None)
-            elif choice == "asis":
-                req.future.set_result("asis")
-            elif choice == "list":
-                req.future.set_result("list")
-            else:
-                req.future.set_result(int(choice))
-        else:
-            await q.put(req)
+    if choice == "skip":
+        req.future.set_result(None)
+    elif choice == "asis":
+        req.future.set_result("asis")
+    elif choice == "list":
+        req.future.set_result("list")
+    else:
+        req.future.set_result(int(choice))
 
     await callback.message.delete()
     await callback.answer()
