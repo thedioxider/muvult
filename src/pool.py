@@ -21,14 +21,26 @@ def create_symlink(pool_file: Path, user_dir: Path) -> Path:
     return link_path
 
 
+def _cleanup_empty_parents(path: Path, stop_at: Path | None = None) -> None:
+    parent = path.parent
+    while stop_at is None or parent != stop_at:
+        try:
+            parent.rmdir()
+        except OSError:
+            break
+        parent = parent.parent
+
+
 def remove_symlink(symlink_path: Path) -> None:
     if symlink_path.is_symlink():
         symlink_path.unlink()
+        _cleanup_empty_parents(symlink_path)
 
 
 def remove_pool_file(pool_file: Path) -> None:
     if pool_file.exists():
         pool_file.unlink()
+        _cleanup_empty_parents(pool_file, _pool_root(pool_file))
 
 
 def update_symlinks(old_pool: Path, new_pool: Path, symlink_paths: list[Path]) -> list[Path]:
