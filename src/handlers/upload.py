@@ -1,7 +1,7 @@
 import asyncio
 from asyncio import get_running_loop
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from aiogram import Bot, Router
@@ -10,8 +10,8 @@ from sqlmodel import select
 
 from ..beets_svc import get_candidates, apply_and_move, move_as_is
 from ..db import Track, TrackOwnership, User, get_session
-from ..models import Candidate, ConfirmationMode, FileStatus, TagResult
-from ..pool import create_symlink, remove_symlink, remove_pool_file, update_symlinks
+from ..models import ConfirmationMode, FileStatus, TagResult
+from ..pool import create_symlink, remove_pool_file, update_symlinks
 from ..quality import is_better
 
 upload_router = Router()
@@ -57,18 +57,20 @@ def _format_status_message(states: dict[str, FileState]) -> str:
     for fs in states.values():
         groups.setdefault(fs.status, []).append(fs)
 
-    lines = []
+    all_done = all(fs.status in _TERMINAL for fs in states.values())
+
+    lines = [] if all_done else ["***⏳ Processing...***", ""]
     for status in FileStatus:
         files = groups.get(status, [])
         if not files:
             continue
         icon = _STATUS_ICONS[status]
         label = _STATUS_LABELS[status]
-        lines.append(f"{icon} {label} ({len(files)}):")
+        lines.append(f"**{icon} {label} ({len(files)}):**")
         for f in files:
-            note = f" — {f.note}" if f.note else ""
-            lines.append(f"  • {f.original_name}{note}")
-    return "\n".join(lines) or "Processing..."
+            note = f" ~ {f.note}" if f.note else ""
+            lines.append(f"  — {f.original_name}{note}")
+    return "\n".join(lines)
 
 
 @dataclass
@@ -93,13 +95,13 @@ async def _ask_confirmation(bot: Bot, tg_id: int, req: "_ConfirmationRequest") -
             InlineKeyboardButton(text="Import as-is", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}asis"),
             InlineKeyboardButton(text="Skip", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}skip"),
         ]]
-        text = f"No matches found for *{req.filename}*"
+        text = f"❌ No matches found for:\n*{req.filename}*"
     elif tag.recommendation >= 3:
         c = tag.candidates[0]
         text = (
-            f"*{req.filename}*\n"
-            f"Match: {c.artist} — {c.title} ({c.album}, {c.year})\n"
-            f"Confidence: {(1 - c.distance) * 100:.0f}%"
+            f"❓ *{req.filename}*\n\n"
+            f"Match: *{c.artist} — {c.title}* ({c.album}, {c.year})\n"
+            f"Confidence: **{(1 - c.distance) * 100:.0f}%**"
         )
         buttons = [[
             InlineKeyboardButton(text="Import", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}0"),
@@ -107,13 +109,18 @@ async def _ask_confirmation(bot: Bot, tg_id: int, req: "_ConfirmationRequest") -
             InlineKeyboardButton(text="Skip", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}skip"),
         ]]
     else:
-        text = f"Low confidence matches for *{req.filename}*:"
+        text = f"❓ Matches for:\n*{req.filename}*:"
         rows = []
-        for c in tag.candidates:
-            rows.append([InlineKeyboardButton(
-                text=f"{c.artist} — {c.title} ({(1 - c.distance) * 100:.0f}%)",
-                callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}{c.index}",
-            )])
+        for i, c in enumerate(tag.candidates[:6]):
+            text += f"{i}. *{c.artist} — {c.title}* ({c.album}, {c.year})\n"
+            new_button = InlineKeyboardButton(
+                    text=f"#{i} ({(1 - c.distance) * 100:.0f}%)",
+                    callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}{c.index}",
+                )
+            if i % 2 == 1:
+                rows.append([new_button])
+            else:
+                rows[-1].append(new_button)
         rows.append([
             InlineKeyboardButton(text="Import as-is", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}asis"),
             InlineKeyboardButton(text="Skip", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}skip"),
@@ -315,8 +322,6 @@ async def cb_confirmation(callback: CallbackQuery, bot: Bot) -> None:
 
 @upload_router.message(lambda m: m.audio or m.document)
 async def handle_audio(message: Message, bot: Bot) -> None:
-    from ..config import settings
-
     tg_id = message.from_user.id
 
     audio = message.audio or message.document

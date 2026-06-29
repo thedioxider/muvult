@@ -13,13 +13,13 @@ user_router = Router()
 _USER_HELP = (
     "/help — this message\n"
     "/start — welcome message\n"
-    "/settings — change confirmation mode\n"
+    "/settings — change bot preferences\n"
     "/id — show your Telegram ID\n\n"
     "Send audio files to upload them to your library."
 )
 
 _ADMIN_SECTION = (
-    "\n\n*Admin:*\n"
+    "\n\n**Admin:**\n"
     "/adduser <tg\\_id> <username>\n"
     "/removeuser <tg\\_id>\n"
     "/settgid <username> <new\\_tg\\_id>\n"
@@ -49,10 +49,13 @@ async def cmd_start(message: Message, is_admin: bool = False) -> None:
     if row:
         await message.answer(
             "Send me audio files to upload them to your music library.\n"
-            "Use /settings to change confirmation mode."
+            "Use /settings to change bot preferences."
         )
     elif is_admin:
-        await message.answer("You don't have a user account yet. Use /adduser to add yourself.")
+        await message.answer(
+            "You don't have a user account yet.\n"
+            "Use /adduser to add yourself."
+        )
     else:
         await message.answer(
             f"You are not authorized. Ask an admin to add you.\n"
@@ -81,7 +84,13 @@ async def cmd_settings(message: Message) -> None:
             for m in ("off", "auto", "on")
         ]
     ])
-    await message.answer("Confirmation mode:", reply_markup=keyboard)
+    await message.answer(
+        "Confirmation mode for metadata search:\n"
+        "  — off: don't ask anything\n"
+        "  — auto: ask only when no exact matches found\n"
+        "  — on: ask even if exact match is found",
+        reply_markup=keyboard
+    )
 
 
 @user_router.callback_query(lambda c: c.data and c.data.startswith("set_conf:"))
