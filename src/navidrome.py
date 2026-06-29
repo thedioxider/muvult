@@ -37,14 +37,14 @@ class NavidromeClient:
             return r
 
     async def create_library(self, username: str) -> int:
-        r = await self._request("POST", "/api/library", json={"name": username, "path": f"{self._music_path}/{username}"})
+        r = await self._request("POST", "/api/library", json={"name": f"{username}'s library", "path": f"{self._music_path}/{username}"})
         return r.json()["id"]
 
     async def delete_library(self, library_id: int) -> None:
         await self._request("DELETE", f"/api/library/{library_id}")
 
     async def update_library(self, library_id: int, username: str) -> None:
-        await self._request("PUT", f"/api/library/{library_id}", json={"name": username, "path": f"{self._music_path}/{username}"})
+        await self._request("PUT", f"/api/library/{library_id}", json={"name": f"{username}'s library", "path": f"{self._music_path}/{username}"})
 
     async def get_user(self, username: str) -> dict:
         r = await self._request("GET", "/api/user")
