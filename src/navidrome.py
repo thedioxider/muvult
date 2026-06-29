@@ -26,6 +26,8 @@ class NavidromeClient:
         return {"X-ND-Authorization": f"Bearer {self._token}"}
 
     async def _request(self, method: str, path: str, **kwargs) -> httpx.Response:
+        import logging
+        log = logging.getLogger(__name__)
         headers = await self._auth_header()
         async with httpx.AsyncClient() as c:
             r = await c.request(method, f"{self._base}{path}", headers=headers, **kwargs)
@@ -33,6 +35,8 @@ class NavidromeClient:
                 self._token = None
                 headers = await self._auth_header()
                 r = await c.request(method, f"{self._base}{path}", headers=headers, **kwargs)
+            if not r.is_success:
+                log.error("Navidrome %s %s → %s: %s", method, path, r.status_code, r.text)
             r.raise_for_status()
             return r
 
