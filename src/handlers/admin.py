@@ -102,17 +102,17 @@ async def _local_rename(old: str, new: str) -> None:
 async def cmd_adduser(message: Message) -> None:
     parts = (message.text or "").split()
     if len(parts) != 3:
-        await message.answer("Usage: /adduser <tg_id> <navidrome_username>")
+        await message.answer("Usage: /adduser <navidrome_username> <tg_id>")
         return
 
+    username = parts[1]
     try:
-        tg_id = int(parts[1])
+        tg_id = int(parts[2])
     except ValueError:
         await message.answer("tg_id must be an integer")
         return
 
     from ..config import settings
-    username = parts[2]
     nd = _nd()
 
     Path(settings.music_root, username).mkdir(parents=True, exist_ok=True)
@@ -140,33 +140,30 @@ async def cmd_adduser(message: Message) -> None:
 async def cmd_removeuser(message: Message) -> None:
     parts = (message.text or "").split()
     if len(parts) != 2:
-        await message.answer("Usage: /removeuser <tg_id>")
+        await message.answer("Usage: /removeuser <username>")
         return
 
-    try:
-        tg_id = int(parts[1])
-    except ValueError:
-        await message.answer("tg_id must be an integer")
-        return
+    username = parts[1]
 
     async with get_session() as session:
-        result = await session.exec(select(User).where(User.tg_id == tg_id))
+        result = await session.exec(select(User).where(User.username == username))
         user = result.first()
     if not user:
-        await message.answer(f"No user with tg_id={tg_id}")
+        await message.answer(f"No user: {username}")
         return
 
+    tg_id = user.tg_id
     try:
         await _nd().delete_library(user.navidrome_library_id)
     except httpx.HTTPError as e:
         await message.answer(
             f"Navidrome unreachable: {e}\n"
-            f"Remove {user.username} from DB anyway? (library will remain in Navidrome)",
+            f"Remove {username} from DB anyway? (library will remain in Navidrome)",
             reply_markup=_nd_err_keyboard(f"rm{_ND_SEP}{tg_id}"),
         )
         return
 
-    username = await _local_remove(tg_id)
+    await _local_remove(tg_id)
     await message.answer(f"Removed user {username}")
 
 
