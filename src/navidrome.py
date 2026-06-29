@@ -41,7 +41,12 @@ class NavidromeClient:
             return r
 
     async def create_library(self, username: str) -> int:
-        r = await self._request("POST", "/api/library", json={"name": f"{username}'s library", "path": f"{self._music_path}/{username}"})
+        path = f"{self._music_path}/{username}"
+        r = await self._request("GET", "/api/library")
+        for lib in r.json():
+            if lib.get("path") == path:
+                return lib["id"]
+        r = await self._request("POST", "/api/library", json={"name": f"{username}'s library", "path": path})
         return r.json()["id"]
 
     async def delete_library(self, library_id: int) -> None:
