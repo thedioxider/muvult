@@ -295,6 +295,27 @@ async def cmd_recreatelinks(message: Message) -> None:
     await message.answer(msg, parse_mode="HTML")
 
 
+def _parse_wildcard_prefix(path: str) -> str | None:
+    """Return the prefix (without trailing /*) if path is a valid wildcard pattern, else None."""
+    parts = path.split("/")
+    if parts[-1] != "*" or len(parts) < 2:
+        return None
+    prefix_parts = parts[:-1]
+    if any(p in ("", "..") or "*" in p for p in prefix_parts):
+        return None
+    return "/".join(prefix_parts)
+
+
+async def _remove_track(session: Any, pool_root: Path, track: Track) -> None:
+    own_result = await session.exec(
+        select(TrackOwnership).where(TrackOwnership.track_id == track.id)
+    )
+    for ownership in own_result.all():
+        remove_symlink(Path(ownership.symlink_path))
+    remove_pool_file(pool_root / track.pool_path)
+    await session.delete(track)
+
+
 @admin_router.message(Command("removetrack"))
 async def cmd_removetrack(message: Message) -> None:
     parts = (message.text or "").split(maxsplit=1)
@@ -306,21 +327,27 @@ async def cmd_removetrack(message: Message) -> None:
     from ..config import settings
     pool_root = Path(settings.music_root) / ".pool"
 
+    prefix = _parse_wildcard_prefix(rel_path)
+    if prefix is not None:
+        async with get_session() as session:
+            result = await session.exec(select(Track))
+            tracks = [t for t in result.all() if t.pool_path.startswith(prefix + "/")]
+            if not tracks:
+                await message.answer(f"No tracks found under: {prefix}")
+                return
+            for track in tracks:
+                await _remove_track(session, pool_root, track)
+            await session.commit()
+        await message.answer(f"Removed {len(tracks)} track(s) under: {prefix}")
+        return
+
     async with get_session() as session:
         result = await session.exec(select(Track).where(Track.pool_path == rel_path))
         track = result.first()
         if not track:
             await message.answer(f"Track not found: {rel_path}")
             return
-
-        own_result = await session.exec(
-            select(TrackOwnership).where(TrackOwnership.track_id == track.id)
-        )
-        for ownership in own_result.all():
-            remove_symlink(Path(ownership.symlink_path))
-
-        remove_pool_file(pool_root / track.pool_path)
-        await session.delete(track)
+        await _remove_track(session, pool_root, track)
         await session.commit()
 
     await message.answer(f"Removed: {rel_path}")
