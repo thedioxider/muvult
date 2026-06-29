@@ -225,7 +225,7 @@ async def _process_file(
                     old_links = [Path(o.symlink_path) for o in ownerships]
                     new_links = update_symlinks(pool_root / existing.pool_path, pool_file, old_links)
                     remove_pool_file(pool_root / existing.pool_path)
-                    note = f"replaced {existing.format.upper()} {existing.bitrate}kbps"
+                    note = f"{existing.format.upper()} {existing.bitrate}kbps → {new_format.upper()} {new_bitrate}kbps"
                     existing.pool_path = pool_rel(pool_file)
                     existing.bitrate = new_bitrate
                     existing.format = new_format
@@ -234,10 +234,8 @@ async def _process_file(
                     track_id = existing.id
                 else:
                     remove_pool_file(pool_file)
-                    states[filename] = FileState(filename, FileStatus.DUPLICATE, "better quality exists")
-                    await _edit_status(bot, status_chat_id, status_msg_id, states)
-                    await session.commit()
-                    return
+                    pool_file = pool_root / existing.pool_path
+                    track_id = existing.id
             else:
                 track = Track(
                     pool_path=pool_rel(pool_file), musicbrainz_id=mb_id,
@@ -251,14 +249,18 @@ async def _process_file(
                 select(TrackOwnership)
                 .where(TrackOwnership.track_id == track_id, TrackOwnership.user_id == user_id)
             )
-            if not own_check.first():
+            already_owned = own_check.first()
+            if not already_owned:
                 u_result = await session.exec(select(User).where(User.id == user_id))
                 user_dir = Path(settings.music_root) / u_result.first().username
                 symlink = create_symlink(pool_file, user_dir)
                 session.add(TrackOwnership(track_id=track_id, user_id=user_id, symlink_path=str(symlink)))
             await session.commit()
 
-        states[filename] = FileState(filename, FileStatus.IMPORTED, note)
+        if already_owned:
+            states[filename] = FileState(filename, FileStatus.DUPLICATE)
+        else:
+            states[filename] = FileState(filename, FileStatus.IMPORTED, note)
         await _edit_status(bot, status_chat_id, status_msg_id, states)
 
     except Exception as e:
