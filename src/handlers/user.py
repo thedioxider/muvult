@@ -20,8 +20,8 @@ _USER_HELP = (
 
 _ADMIN_SECTION = (
     "\n\n**Admin:**\n"
-    "/adduser <tg\\_id> <username>\n"
-    "/removeuser <tg\\_id>\n"
+    "/adduser <username> <tg\\_id>\n"
+    "/removeuser <username>\n"
     "/settgid <username> <new\\_tg\\_id>\n"
     "/setusername <old> <new>\n"
     "/users"

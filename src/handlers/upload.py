@@ -70,7 +70,7 @@ def _format_status_message(states: dict[str, FileState]) -> str:
         for f in files:
             note = f" ~ {f.note}" if f.note else ""
             lines.append(f"  — <i>{f.original_name}</i>{note}")
-    return "\n".join(lines)
+    return "\n".join(lines) or "⏳ Processing..."
 
 
 @dataclass
@@ -101,7 +101,7 @@ async def _ask_confirmation(bot: Bot, tg_id: int, req: "_ConfirmationRequest") -
         text = (
             f"❓ *{req.filename}*\n\n"
             f"Match: *{c.artist} — {c.title}* ({c.album}, {c.year})\n"
-            f"Confidence: **{(1 - c.distance) * 100:.0f}%**"
+            f"Confidence: *{(1 - c.distance) * 100:.0f}%*"
         )
         buttons = [[
             InlineKeyboardButton(text="Import", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}0"),
@@ -117,7 +117,7 @@ async def _ask_confirmation(bot: Bot, tg_id: int, req: "_ConfirmationRequest") -
                     text=f"#{i} ({(1 - c.distance) * 100:.0f}%)",
                     callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}{c.index}",
                 )
-            if i % 2 == 1:
+            if i % 2 == 0:
                 rows.append([new_button])
             else:
                 rows[-1].append(new_button)
@@ -281,22 +281,29 @@ async def _queue_confirmation(
     await _edit_status(bot, status_chat_id, status_msg_id, states)
 
     if not _confirmation_active.get(tg_id):
+        _confirmation_active[tg_id] = True
         asyncio.create_task(_drain_confirmation_queue(bot, tg_id))
 
     return await future
 
 
 async def _drain_confirmation_queue(bot: Bot, tg_id: int) -> None:
-    _confirmation_active[tg_id] = True
     q = _confirmation_queues.get(tg_id)
-    while q and not q.empty():
-        req: _ConfirmationRequest = await q.get()
-        if not req.future.done():
-            _active_confirmations[tg_id] = req
-            await _ask_confirmation(bot, tg_id, req)
-            await req.future
-            _active_confirmations.pop(tg_id, None)
-    _confirmation_active[tg_id] = False
+    try:
+        while q and not q.empty():
+            req: _ConfirmationRequest = await q.get()
+            if not req.future.done():
+                _active_confirmations[tg_id] = req
+                try:
+                    await _ask_confirmation(bot, tg_id, req)
+                    await req.future
+                except Exception as e:
+                    if not req.future.done():
+                        req.future.set_exception(e)
+                finally:
+                    _active_confirmations.pop(tg_id, None)
+    finally:
+        _confirmation_active[tg_id] = False
 
 
 @upload_router.callback_query(lambda c: c.data and c.data.startswith(f"conf{_CB_SEP}"))
@@ -316,7 +323,11 @@ async def cb_confirmation(callback: CallbackQuery, bot: Bot) -> None:
     elif choice == "list":
         req.future.set_result("list")
     else:
-        req.future.set_result(int(choice))
+        try:
+            req.future.set_result(int(choice))
+        except ValueError:
+            await callback.answer("Invalid choice")
+            return
 
     await callback.message.delete()
     await callback.answer()
