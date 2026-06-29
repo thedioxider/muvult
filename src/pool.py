@@ -13,8 +13,8 @@ def pool_rel(pool_file: Path) -> str:
     return str(pool_file.relative_to(_pool_root(pool_file)))
 
 
-def create_symlink(pool_file: Path, user_dir: Path) -> Path:
-    relative = pool_file.relative_to(_pool_root(pool_file))
+def create_symlink(pool_file: Path, user_dir: Path, *, flat: bool = False) -> Path:
+    relative = Path(pool_file.name) if flat else pool_file.relative_to(_pool_root(pool_file))
     link_path = user_dir / relative
     link_path.parent.mkdir(parents=True, exist_ok=True)
     link_path.symlink_to(os.path.relpath(pool_file, link_path.parent))

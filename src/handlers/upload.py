@@ -191,8 +191,9 @@ async def _process_file(
                 file_path.unlink()
             return
 
-        if chosen_index == "asis":
-            pool_file = await move_as_is(file_path)
+        is_asis = chosen_index == "asis"
+        if is_asis:
+            pool_file = await move_as_is(file_path, db_user.username)
             mb_id = None
         else:
             candidate = tag_result.candidates[int(chosen_index)]
@@ -253,7 +254,7 @@ async def _process_file(
             if not already_owned:
                 u_result = await session.exec(select(User).where(User.id == user_id))
                 user_dir = Path(settings.music_root) / u_result.first().username
-                symlink = create_symlink(pool_file, user_dir)
+                symlink = create_symlink(pool_file, user_dir, flat=is_asis)
                 session.add(TrackOwnership(track_id=track_id, user_id=user_id, symlink_path=str(symlink)))
             await session.commit()
 

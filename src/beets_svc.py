@@ -73,16 +73,18 @@ def _apply_and_move_sync(file_path: Path, candidate: Candidate) -> Path:
     return Path(os.fsdecode(item.path))
 
 
-async def move_as_is(file_path: Path) -> Path:
+async def move_as_is(file_path: Path, username: str) -> Path:
     loop = get_running_loop()
-    return await loop.run_in_executor(None, _move_as_is_sync, file_path)
+    return await loop.run_in_executor(None, _move_as_is_sync, file_path, username)
 
 
-def _move_as_is_sync(file_path: Path) -> Path:
-    item = Item.from_path(str(file_path))
-    item.add(_lib)
-    dest = Path(os.fsdecode(item.destination()))
+def _move_as_is_sync(file_path: Path, username: str) -> Path:
+    users_root = (Path(_lib.directory) / "users").resolve()
+    dest = (users_root / username / file_path.name).resolve()
+    if not dest.is_relative_to(users_root):
+        raise ValueError(f"path traversal detected for username {username!r}")
+    dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists():
         dest.unlink()
-    item.move(store=True)
-    return Path(os.fsdecode(item.path))
+    file_path.rename(dest)
+    return dest
