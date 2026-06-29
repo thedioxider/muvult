@@ -120,9 +120,9 @@ async def _ask_confirmation(bot: Bot, tg_id: int, req: "_ConfirmationRequest") -
             artist = html.escape(c.artist)
             title = html.escape(c.title)
             album = html.escape(c.album)
-            text += f"{i}. <b>{artist} — {title}</b> ({album}, {c.year})\n"
+            text += f"{i + 1}. <b>{artist} — {title}</b> ({album}, {c.year})\n"
             new_button = InlineKeyboardButton(
-                    text=f"#{i} ({(1 - c.distance) * 100:.0f}%)",
+                    text=f"#{i + 1} ({(1 - c.distance) * 100:.0f}%)",
                     callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}{c.index}",
                 )
             if i % 2 == 0:
