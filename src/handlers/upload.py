@@ -59,17 +59,17 @@ def _format_status_message(states: dict[str, FileState]) -> str:
 
     all_done = all(fs.status in _TERMINAL for fs in states.values())
 
-    lines = [] if all_done else ["***⏳ Processing...***", ""]
+    lines = [] if all_done else ["<b><i>⏳ Processing...</i></b>", ""]
     for status in FileStatus:
         files = groups.get(status, [])
         if not files:
             continue
         icon = _STATUS_ICONS[status]
         label = _STATUS_LABELS[status]
-        lines.append(f"**{icon} {label} ({len(files)}):**")
+        lines.append(f"<b>{icon} {label}</b> ({len(files)}):")
         for f in files:
             note = f" ~ {f.note}" if f.note else ""
-            lines.append(f"  — {f.original_name}{note}")
+            lines.append(f"  — <i>{f.original_name}</i>{note}")
     return "\n".join(lines)
 
 
@@ -83,7 +83,7 @@ class _ConfirmationRequest:
 
 async def _edit_status(bot: Bot, chat_id: int, msg_id: int, states: dict[str, FileState]) -> None:
     try:
-        await bot.edit_message_text(_format_status_message(states), chat_id=chat_id, message_id=msg_id)
+        await bot.edit_message_text(_format_status_message(states), chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
     except Exception:
         pass
 
@@ -338,7 +338,7 @@ async def handle_audio(message: Message, bot: Bot) -> None:
     user_id = row.id
 
     states: dict[str, FileState] = {filename: FileState(filename, FileStatus.DOWNLOADING)}
-    status_msg = await message.answer(_format_status_message(states))
+    status_msg = await message.answer(_format_status_message(states), parse_mode="HTML")
 
     asyncio.create_task(_process_file(
         bot=bot,
