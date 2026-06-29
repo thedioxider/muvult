@@ -79,7 +79,7 @@ async def move_as_is(file_path: Path, username: str) -> Path:
 
 
 def _move_as_is_sync(file_path: Path, username: str) -> Path:
-    users_root = (Path(_lib.directory) / "users").resolve()
+    users_root = (Path(os.fsdecode(_lib.directory)) / "users").resolve()
     dest = (users_root / username / file_path.name).resolve()
     if not dest.is_relative_to(users_root):
         raise ValueError(f"path traversal detected for username {username!r}")
