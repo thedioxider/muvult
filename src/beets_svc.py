@@ -1,6 +1,7 @@
 import asyncio
 import os
 import re
+import shutil
 from asyncio import get_running_loop
 from pathlib import Path
 
@@ -22,7 +23,7 @@ def setup_beets(music_root: str) -> None:
     pool_path = str(Path(music_root) / ".pool")
     beets_config.read(user=False, defaults=True)
     beets_config["plugins"].set(["musicbrainz"])
-    beets_config["musicbrainz"]["searchlimit"].set(10)
+    beets_config["musicbrainz"]["search_limit"].set(10)
     plugins.load_plugins()
     from .beets_patches import patch_mb_phrase_search
     patch_mb_phrase_search()
@@ -91,5 +92,5 @@ def _move_as_is_sync(file_path: Path, username: str) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists():
         dest.unlink()
-    file_path.rename(dest)
+    shutil.move(str(file_path), str(dest))
     return dest
