@@ -26,7 +26,7 @@ _ADMIN_SECTION = (
     "/setusername [old] [new]\n"
     "/users\n"
     "/recreatelinks [username]\n"
-    "/removetrack [pool-relative-path]"
+    "/removetrack [path|prefix/*] [username]"
 )
 
 

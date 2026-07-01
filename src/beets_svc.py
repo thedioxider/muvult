@@ -1,5 +1,6 @@
 import asyncio
 import os
+import shutil
 from asyncio import get_running_loop
 from pathlib import Path
 
@@ -19,10 +20,10 @@ def setup_beets(music_root: str) -> None:
     pool_path = str(Path(music_root) / ".pool")
     beets_config.read(user=False, defaults=True)
     beets_config["plugins"].set(["musicbrainz"])
-    beets_config["musicbrainz"]["searchlimit"].set(10)
+    beets_config["musicbrainz"]["search_limit"].set(10)
     plugins.load_plugins()
-    from .beets_patches import patch_mb_phrase_search
-    patch_mb_phrase_search()
+    from .beets_patches import patch_mb_search
+    patch_mb_search()
     beets_config["asciify_paths"].set(True)
     beets_config["paths"]["default"].set("$albumartist/$album/$track - $title")
     beets_config["paths"]["singleton"].set("$albumartist/$album/$track - $title")
@@ -79,12 +80,12 @@ async def move_as_is(file_path: Path, username: str) -> Path:
 
 
 def _move_as_is_sync(file_path: Path, username: str) -> Path:
-    users_root = (Path(_lib.directory) / "users").resolve()
+    users_root = (Path(os.fsdecode(_lib.directory)) / "users").resolve()
     dest = (users_root / username / file_path.name).resolve()
     if not dest.is_relative_to(users_root):
         raise ValueError(f"path traversal detected for username {username!r}")
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists():
         dest.unlink()
-    file_path.rename(dest)
+    shutil.move(str(file_path), str(dest))
     return dest

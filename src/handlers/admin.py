@@ -1,3 +1,5 @@
+import secrets
+import shlex
 import shutil
 from pathlib import Path
 from typing import Any
@@ -295,35 +297,145 @@ async def cmd_recreatelinks(message: Message) -> None:
     await message.answer(msg, parse_mode="HTML")
 
 
+_pending_pool_deletes: dict[str, list[int]] = {}
+
+
+def _parse_wildcard_prefix(path: str) -> str | None:
+    parts = path.split("/")
+    if parts[-1] != "*" or len(parts) < 2:
+        return None
+    prefix_parts = parts[:-1]
+    if any(p in ("", "..") or "*" in p for p in prefix_parts):
+        return None
+    return "/".join(prefix_parts)
+
+
+async def _remove_track(session: Any, pool_root: Path, track: Track) -> None:
+    own_result = await session.exec(select(TrackOwnership).where(TrackOwnership.track_id == track.id))
+    for o in own_result.all():
+        remove_symlink(Path(o.symlink_path))
+    remove_pool_file(pool_root / track.pool_path)
+    await session.delete(track)
+
+
+async def _drop_ownership(session: Any, track: Track, user_id: int) -> bool | None:
+    """Remove user's ownership. Returns True if orphaned, False if others remain, None if not owned."""
+    own = (await session.exec(
+        select(TrackOwnership).where(
+            TrackOwnership.track_id == track.id, TrackOwnership.user_id == user_id
+        )
+    )).first()
+    if not own:
+        return None
+    remove_symlink(Path(own.symlink_path))
+    await session.delete(own)
+    await session.flush()
+    return not (await session.exec(
+        select(TrackOwnership).where(TrackOwnership.track_id == track.id)
+    )).first()
+
+
+def _orphan_keyboard(key: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Yes, delete", callback_data=f"pool_del:{key}:yes"),
+        InlineKeyboardButton(text="No, keep", callback_data=f"pool_del:{key}:no"),
+    ]])
+
+
+@admin_router.callback_query(lambda c: c.data and c.data.startswith("pool_del:"))
+async def cb_pool_delete(callback: CallbackQuery) -> None:
+    _, key, choice = callback.data.split(":", 2)
+    track_ids = _pending_pool_deletes.pop(key, None)
+    if track_ids is None:
+        await callback.message.edit_text(callback.message.text + "\n\n(Expired)")
+        await callback.answer()
+        return
+    suffix = "\n\nKept in pool."
+    if choice == "yes":
+        from ..config import settings
+        pool_root = Path(settings.music_root) / ".pool"
+        async with get_session() as session:
+            for tid in track_ids:
+                t = (await session.exec(select(Track).where(Track.id == tid))).first()
+                if t:
+                    remove_pool_file(pool_root / t.pool_path)
+                    await session.delete(t)
+            await session.commit()
+        suffix = f"\n\nDeleted {len(track_ids)} track(s) from pool."
+    await callback.message.edit_text(callback.message.text + suffix)
+    await callback.answer()
+
+
 @admin_router.message(Command("removetrack"))
 async def cmd_removetrack(message: Message) -> None:
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) != 2:
-        await message.answer("Usage: /removetrack <path-relative-to-pool>")
+    try:
+        args = shlex.split((message.text or "").split(" ", 1)[1] if " " in (message.text or "") else "")
+    except ValueError:
+        await message.answer("Invalid syntax (unclosed quote?)")
+        return
+    if not args:
+        await message.answer("Usage: /removetrack <path> [username]")
         return
 
-    rel_path = parts[1].strip()
+    rel_path = args[0]
+    username: str | None = None
+    target_user_id: int | None = None
+
+    if len(args) >= 2:
+        async with get_session() as session:
+            u = (await session.exec(select(User).where(User.username == args[1]))).first()
+        if not u:
+            await message.answer(f"No user: {args[1]}")
+            return
+        username, target_user_id = args[1], u.id
     from ..config import settings
     pool_root = Path(settings.music_root) / ".pool"
+    prefix = _parse_wildcard_prefix(rel_path)
 
     async with get_session() as session:
-        result = await session.exec(select(Track).where(Track.pool_path == rel_path))
-        track = result.first()
-        if not track:
-            await message.answer(f"Track not found: {rel_path}")
+        if prefix is not None:
+            result = await session.exec(select(Track))
+            tracks = [t for t in result.all() if t.pool_path.startswith(prefix + "/")]
+        else:
+            t = (await session.exec(select(Track).where(Track.pool_path == rel_path))).first()
+            tracks = [t] if t else []
+
+        if not tracks:
+            await message.answer(f"No tracks found: {rel_path}")
             return
 
-        own_result = await session.exec(
-            select(TrackOwnership).where(TrackOwnership.track_id == track.id)
-        )
-        for ownership in own_result.all():
-            remove_symlink(Path(ownership.symlink_path))
+        if target_user_id is None:
+            for track in tracks:
+                await _remove_track(session, pool_root, track)
+            await session.commit()
+            await message.answer(f"Removed {len(tracks)} track(s).")
+            return
 
-        remove_pool_file(pool_root / track.pool_path)
-        await session.delete(track)
+        orphaned: list[int] = []
+        removed = 0
+        for track in tracks:
+            r = await _drop_ownership(session, track, target_user_id)
+            if r is not None:
+                removed += 1
+                if r:
+                    orphaned.append(track.id)
         await session.commit()
 
-    await message.answer(f"Removed: {rel_path}")
+    if not removed:
+        await message.answer(f"No tracks owned by {username}: {rel_path}")
+        return
+
+    base = f"Removed {removed} track(s) from {username}."
+    if not orphaned:
+        await message.answer(base)
+        return
+
+    key = secrets.token_hex(6)
+    _pending_pool_deletes[key] = orphaned
+    await message.answer(
+        base + f"\n{len(orphaned)} track(s) now have no owners. Delete from pool and DB?",
+        reply_markup=_orphan_keyboard(key),
+    )
 
 
 @admin_router.message(Command("users"))
