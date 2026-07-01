@@ -51,6 +51,8 @@ def _get_candidates_sync(file_path: Path) -> TagResult:
                 mb_track_id=info.track_id,
                 distance=match.distance.distance,
                 _match=match,
+                length=getattr(info, "length", None),
+                disambig=getattr(info, "trackdisambig", None),
             )
         )
     return TagResult(candidates=candidates, recommendation=int(proposal.recommendation))

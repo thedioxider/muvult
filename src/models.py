@@ -29,6 +29,8 @@ class Candidate:
     mb_track_id: str | None
     distance: float
     _match: Any = field(repr=False)
+    length: float | None = None
+    disambig: str | None = None
 
 
 @dataclass

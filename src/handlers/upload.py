@@ -78,6 +78,21 @@ def _format_status_message(states: dict[str, FileState]) -> str:
     return "\n".join(lines) or "⏳ Processing..."
 
 
+def _candidate_detail(c) -> str:
+    """Recording-appropriate suffix: MB disambiguation and duration.
+
+    Singleton matches carry no album/year (a recording spans many releases),
+    so we show what a recording actually has to tell near-identical titles apart.
+    """
+    bits = []
+    if c.disambig:
+        bits.append(html.escape(c.disambig))
+    if c.length:
+        m, s = divmod(int(c.length), 60)
+        bits.append(f"{m}:{s:02d}")
+    return f" [{', '.join(bits)}]" if bits else ""
+
+
 @dataclass
 class _ConfirmationRequest:
     filename: str
@@ -106,10 +121,9 @@ async def _ask_confirmation(bot: Bot, tg_id: int, req: "_ConfirmationRequest") -
         c = tag.candidates[0]
         artist = html.escape(c.artist)
         title = html.escape(c.title)
-        album = html.escape(c.album)
         text = (
             f"❓ <i>{fname}</i>\n\n"
-            f"Match: <i>{artist} — {title}</i> ({album}, {c.year})\n"
+            f"Match: <i>{artist} — {title}</i>{_candidate_detail(c)}\n"
             f"Confidence: <b>{(1 - c.distance) * 100:.0f}%</b>"
         )
         buttons = [[
@@ -123,8 +137,7 @@ async def _ask_confirmation(bot: Bot, tg_id: int, req: "_ConfirmationRequest") -
         for i, c in enumerate(tag.candidates[:6]):
             artist = html.escape(c.artist)
             title = html.escape(c.title)
-            album = html.escape(c.album)
-            text += f"{i + 1}. <i>{artist} — {title}</i> ({album}, {c.year})\n"
+            text += f"{i + 1}. <i>{artist} — {title}</i>{_candidate_detail(c)}\n"
             new_button = InlineKeyboardButton(
                     text=f"#{i + 1} ({(1 - c.distance) * 100:.0f}%)",
                     callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}{c.index}",
