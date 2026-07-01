@@ -30,7 +30,7 @@ def _mock_session(exec_return=None):
 
 @pytest.mark.asyncio
 async def test_adduser_success():
-    msg = _msg("/adduser 99999 alice")
+    msg = _msg("/adduser alice 99999")
     ctx, session = _mock_session()
 
     mock_settings = MagicMock()
@@ -48,7 +48,7 @@ async def test_adduser_success():
     ):
         nd = AsyncMock()
         nd.create_library = AsyncMock(return_value=5)
-        nd.get_user_id = AsyncMock(return_value="nd-uid-alice")
+        nd.get_user = AsyncMock(return_value={"id": "nd-uid-alice", "isAdmin": False})
         nd.set_user_library = AsyncMock()
         MockND.return_value = nd
 
