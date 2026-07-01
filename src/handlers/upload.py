@@ -122,7 +122,7 @@ async def _ask_confirmation(bot: Bot, tg_id: int, req: "_ConfirmationRequest") -
         artist = html.escape(c.artist)
         title = html.escape(c.title)
         text = (
-            f"❓ <i>{fname}</i>\n\n"
+            f"❓ Import <i>{fname}</i>?\n\n"
             f"Match: <i>{artist} — {title}</i>{_candidate_detail(c)}\n"
             f"Confidence: <b>{(1 - c.distance) * 100:.0f}%</b>"
         )
@@ -132,12 +132,12 @@ async def _ask_confirmation(bot: Bot, tg_id: int, req: "_ConfirmationRequest") -
             InlineKeyboardButton(text="Skip", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}skip"),
         ]]
     else:
-        text = f"❓ Matches for:\n<i>{fname}</i>:\n"
+        text = f"❓ Matches for:\n<i>{fname}</i>\n"
         rows = []
         for i, c in enumerate(tag.candidates[:6]):
             artist = html.escape(c.artist)
             title = html.escape(c.title)
-            text += f"{i + 1}. <i>{artist} — {title}</i>{_candidate_detail(c)}\n"
+            text += f"{i + 1}. {artist} — {title}{_candidate_detail(c)}\n"
             new_button = InlineKeyboardButton(
                     text=f"#{i + 1} ({(1 - c.distance) * 100:.0f}%)",
                     callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}{c.index}",
