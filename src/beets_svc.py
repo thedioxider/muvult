@@ -1,6 +1,5 @@
 import asyncio
 import os
-import re
 import shutil
 from asyncio import get_running_loop
 from pathlib import Path
@@ -15,8 +14,6 @@ from .models import Candidate, TagResult
 _BEETS_DB = "/data/beets_pool.db"
 _lib: Library | None = None
 
-_FEAT_RE = re.compile(r"\s*[\(\[]?\s*(?:feat\.?|ft\.?|with)\s+[^\)\]]+[\)\]]?", re.IGNORECASE)
-
 
 def setup_beets(music_root: str) -> None:
     global _lib
@@ -25,8 +22,8 @@ def setup_beets(music_root: str) -> None:
     beets_config["plugins"].set(["musicbrainz"])
     beets_config["musicbrainz"]["search_limit"].set(10)
     plugins.load_plugins()
-    from .beets_patches import patch_mb_phrase_search
-    patch_mb_phrase_search()
+    from .beets_patches import patch_mb_search
+    patch_mb_search()
     beets_config["asciify_paths"].set(True)
     beets_config["paths"]["default"].set("$albumartist/$album/$track - $title")
     beets_config["paths"]["singleton"].set("$albumartist/$album/$track - $title")
@@ -40,8 +37,6 @@ async def get_candidates(file_path: Path) -> TagResult:
 
 def _get_candidates_sync(file_path: Path) -> TagResult:
     item = Item.from_path(str(file_path))
-    if item.title:
-        item.title = _FEAT_RE.sub("", item.title).strip()
     proposal = tag_item(item)
     candidates = []
     for i, match in enumerate(proposal.candidates[:6]):
