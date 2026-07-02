@@ -2,6 +2,7 @@ import asyncio
 from asyncio import get_running_loop
 import html
 import json
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,6 +18,8 @@ from ..quality import is_better
 from ..tg_utils import safe_answer
 
 upload_router = Router()
+
+log = logging.getLogger(__name__)
 
 _CB_SEP = "\x1f"
 
@@ -283,6 +286,7 @@ async def _process_file(
         await _edit_status(bot, status_chat_id, status_msg_id, states)
 
     except Exception as e:
+        log.exception("processing %s failed", filename)
         states[filename] = FileState(filename, FileStatus.FAILED, str(e)[:80])
         await _edit_status(bot, status_chat_id, status_msg_id, states)
         if file_path.exists():
