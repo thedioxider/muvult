@@ -35,11 +35,49 @@ async def get_candidates(file_path: Path) -> TagResult:
     return await loop.run_in_executor(None, _get_candidates_sync, file_path)
 
 
+def _dedup_matches(matches: list) -> list:
+    """Filter out recordings that are indistinguishable to the user.
+
+    MusicBrainz often holds several recording entities for one performance (e.g.
+    one per release of the same album), differing only in trivia -- a sub-second
+    length delta, an ISRC, which release they hang off -- but sharing artist,
+    title, and displayed duration. We keep one representative per
+    (artist, title, seconds) group.
+
+    Within a group the survivor is chosen by, in order:
+
+    - best beets match (lowest distance),
+    - carrying an ISRC (the canonically-registered, typically worldwide
+      recording),
+    - lowest MBID, so the choice is deterministic across uploads.
+
+    Output order follows the input list.
+    """
+    keys = [
+        (
+            (m.info.artist or "").lower(),
+            (m.info.title or "").lower(),
+            int(m.info.length) if getattr(m.info, "length", None) else None,
+        )
+        for m in matches
+    ]
+    chosen: dict[tuple, tuple] = {}  # key -> (rank, match)
+    for key, m in zip(keys, matches):
+        rank = (
+            m.distance.distance,
+            0 if getattr(m.info, "isrc", None) else 1,
+            m.info.track_id or "",
+        )
+        if key not in chosen or rank < chosen[key][0]:
+            chosen[key] = (rank, m)
+    return [m for key, m in zip(keys, matches) if chosen[key][1] is m]
+
+
 def _get_candidates_sync(file_path: Path) -> TagResult:
     item = Item.from_path(str(file_path))
     proposal = tag_item(item)
     candidates = []
-    for i, match in enumerate(proposal.candidates[:6]):
+    for i, match in enumerate(_dedup_matches(proposal.candidates)[:6]):
         info = match.info
         candidates.append(
             Candidate(
