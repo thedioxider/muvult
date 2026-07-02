@@ -14,6 +14,7 @@ from ..db import Track, TrackOwnership, User, get_session
 from ..models import ConfirmationMode, FileStatus, TagResult
 from ..pool import create_symlink, pool_rel, remove_pool_file, update_symlinks
 from ..quality import is_better
+from ..tg_utils import safe_answer
 
 upload_router = Router()
 
@@ -342,7 +343,7 @@ async def cb_confirmation(callback: CallbackQuery, bot: Bot) -> None:
 
     req = _active_confirmations.get(tg_id)
     if not req or req.filename != filename or req.future.done():
-        await callback.answer("No pending confirmation")
+        await safe_answer(callback, "No pending confirmation")
         return
 
     if choice == "skip":
@@ -355,11 +356,11 @@ async def cb_confirmation(callback: CallbackQuery, bot: Bot) -> None:
         try:
             req.future.set_result(int(choice))
         except ValueError:
-            await callback.answer("Invalid choice")
+            await safe_answer(callback, "Invalid choice")
             return
 
     await callback.message.delete()
-    await callback.answer()
+    await safe_answer(callback)
 
 
 async def _flush_group(group_id: str) -> None:

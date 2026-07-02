@@ -6,6 +6,7 @@ from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, C
 from sqlmodel import select
 
 from ..db import User, get_session
+from ..tg_utils import safe_answer
 
 user_router = Router()
 
@@ -99,7 +100,7 @@ async def cmd_settings(message: Message) -> None:
 async def cb_set_confirmation(callback: CallbackQuery) -> None:
     mode = callback.data.split(":")[1]
     if mode not in ("off", "auto", "on"):
-        await callback.answer("Invalid option")
+        await safe_answer(callback, "Invalid option")
         return
 
     tg_id = callback.from_user.id
@@ -107,7 +108,7 @@ async def cb_set_confirmation(callback: CallbackQuery) -> None:
         result = await session.exec(select(User).where(User.tg_id == tg_id))
         row = result.first()
         if not row:
-            await callback.answer("Not found")
+            await safe_answer(callback, "Not found")
             return
         s = json.loads(row.settings)
         s["confirmation"] = mode
@@ -115,4 +116,4 @@ async def cb_set_confirmation(callback: CallbackQuery) -> None:
         await session.commit()
 
     await callback.message.edit_text(f"Confirmation mode set to: <b>{mode}</b>", parse_mode="HTML")
-    await callback.answer()
+    await safe_answer(callback)

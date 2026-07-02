@@ -13,6 +13,7 @@ from sqlmodel import select
 from ..db import Track, TrackOwnership, User, get_session
 from ..navidrome import NavidromeClient
 from ..pool import create_symlink, remove_pool_file, remove_symlink
+from ..tg_utils import safe_answer
 
 _ND_SEP = "\x1f"
 
@@ -233,7 +234,7 @@ async def cb_nd_skip(callback: CallbackQuery) -> None:
 
     if action == "cancel":
         await callback.message.edit_text("Cancelled.")
-        await callback.answer()
+        await safe_answer(callback)
         return
 
     if action == "rm":
@@ -247,7 +248,7 @@ async def cb_nd_skip(callback: CallbackQuery) -> None:
         await _local_rename(old, new)
         await callback.message.edit_text(f"Renamed {old} → {new} (Navidrome library not updated).")
 
-    await callback.answer()
+    await safe_answer(callback)
 
 
 @admin_router.message(Command("recreatelinks"))
@@ -348,7 +349,7 @@ async def cb_pool_delete(callback: CallbackQuery) -> None:
     track_ids = _pending_pool_deletes.pop(key, None)
     if track_ids is None:
         await callback.message.edit_text(callback.message.text + "\n\n(Expired)")
-        await callback.answer()
+        await safe_answer(callback)
         return
     suffix = "\n\nKept in pool."
     if choice == "yes":
@@ -363,7 +364,7 @@ async def cb_pool_delete(callback: CallbackQuery) -> None:
             await session.commit()
         suffix = f"\n\nDeleted {len(track_ids)} track(s) from pool."
     await callback.message.edit_text(callback.message.text + suffix)
-    await callback.answer()
+    await safe_answer(callback)
 
 
 @admin_router.message(Command("removetrack"))
