@@ -2,6 +2,7 @@ import asyncio
 import os
 import shutil
 from asyncio import get_running_loop
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from beets import config as beets_config, plugins
@@ -13,6 +14,12 @@ from .models import Candidate, TagResult
 
 _BEETS_DB = "/data/beets_pool.db"
 _lib: Library | None = None
+
+# All beets work runs on a single thread: MusicBrainz is rate-limited to 1 req/s
+# so parallel tagging only contends, and the shared beets Library (one sqlite
+# file) can hit "database is locked" under concurrent writes. Serializing here
+# keeps downloads and confirmation prompts concurrent while these steps queue.
+_beets_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="beets")
 
 
 def setup_beets(music_root: str) -> None:
@@ -32,7 +39,7 @@ def setup_beets(music_root: str) -> None:
 
 async def get_candidates(file_path: Path) -> TagResult:
     loop = get_running_loop()
-    return await loop.run_in_executor(None, _get_candidates_sync, file_path)
+    return await loop.run_in_executor(_beets_pool, _get_candidates_sync, file_path)
 
 
 def _dedup_matches(matches: list) -> list:
@@ -98,7 +105,7 @@ def _get_candidates_sync(file_path: Path) -> TagResult:
 
 async def apply_and_move(file_path: Path, candidate: Candidate) -> Path:
     loop = get_running_loop()
-    return await loop.run_in_executor(None, _apply_and_move_sync, file_path, candidate)
+    return await loop.run_in_executor(_beets_pool, _apply_and_move_sync, file_path, candidate)
 
 
 def _apply_and_move_sync(file_path: Path, candidate: Candidate) -> Path:
@@ -116,7 +123,7 @@ def _apply_and_move_sync(file_path: Path, candidate: Candidate) -> Path:
 
 async def move_as_is(file_path: Path, username: str) -> Path:
     loop = get_running_loop()
-    return await loop.run_in_executor(None, _move_as_is_sync, file_path, username)
+    return await loop.run_in_executor(_beets_pool, _move_as_is_sync, file_path, username)
 
 
 def _move_as_is_sync(file_path: Path, username: str) -> Path:
