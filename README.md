@@ -56,14 +56,19 @@ recording.
 ### Release enrichment
 
 A MusicBrainz recording carries only track-level metadata (title, artist) -- it
-is not tied to any release, so it has no album, track number, disc, or year. Once
-a candidate is chosen, muvult resolves it to a specific release and pulls full
-album metadata from there. The release is picked, in order, by: official status;
-a primary artist matching the track's (over "Various Artists" compilations); a
-studio album (no secondary types, with album over EP over single); a worldwide
-release; earliest date; then lowest release id. The year comes from the
-recording's earliest official release. If any of this fails the track still
-imports, with recording-level tags only.
+is not tied to any release, so it has no album, track number, disc, or year. When
+enabled, once a candidate is chosen muvult resolves it to a specific release and
+pulls full album metadata from there. The release is picked, in order, by:
+official status; a primary artist matching the track's (over "Various Artists"
+compilations); a studio album (no secondary types, with album over EP over
+single); a worldwide release; earliest date; then lowest release id. The year
+comes from the recording's earliest official release. If any of this fails the
+track still imports, with recording-level tags only.
+
+This costs an extra MusicBrainz lookup per track (rate-limited to 1/s), so it is
+**off by default** and opt-in per user via `/settings` -- with it off, tracks are
+tagged with title and artist only (any album/track tags already on the file are
+kept) and import faster.
 
 ### Confirmation modes
 

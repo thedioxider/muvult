@@ -106,9 +106,9 @@ def _get_candidates_sync(file_path: Path) -> TagResult:
     return TagResult(candidates=candidates, recommendation=int(proposal.recommendation))
 
 
-async def apply_and_move(file_path: Path, candidate: Candidate) -> Path:
+async def apply_and_move(file_path: Path, candidate: Candidate, enrich: bool = True) -> Path:
     loop = get_running_loop()
-    return await loop.run_in_executor(_beets_pool, _apply_and_move_sync, file_path, candidate)
+    return await loop.run_in_executor(_beets_pool, _apply_and_move_sync, file_path, candidate, enrich)
 
 
 def _status_rank(status: str | None) -> int:
@@ -230,10 +230,10 @@ def _enrich_from_release(match) -> dict | None:
         return None
 
 
-def _apply_and_move_sync(file_path: Path, candidate: Candidate) -> Path:
+def _apply_and_move_sync(file_path: Path, candidate: Candidate, enrich: bool = True) -> Path:
     match = candidate._match
     item = match.item
-    enriched = _enrich_from_release(match)
+    enriched = _enrich_from_release(match) if enrich else None
     if enriched is not None:
         item.update(enriched)
     else:

@@ -188,8 +188,9 @@ async def _process_file(
         async with get_session() as session:
             result = await session.exec(select(User).where(User.tg_id == tg_id))
             db_user = result.first()
-        mode_str = json.loads(db_user.settings).get("confirmation", "auto") if db_user else "auto"
-        mode = ConfirmationMode(mode_str)
+        user_settings = json.loads(db_user.settings) if db_user else {}
+        mode = ConfirmationMode(user_settings.get("confirmation", "auto"))
+        enrich = user_settings.get("enrich", False)
 
         is_high = tag_result.recommendation >= 3
         chosen_index: int | str | None = None
@@ -218,7 +219,7 @@ async def _process_file(
             mb_id = None
         else:
             candidate = tag_result.candidates[int(chosen_index)]
-            pool_file = await apply_and_move(file_path, candidate)
+            pool_file = await apply_and_move(file_path, candidate, enrich)
             mb_id = candidate.mb_track_id
 
         from beets import mediafile as mf_lib

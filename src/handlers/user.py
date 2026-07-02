@@ -78,20 +78,32 @@ async def cmd_settings(message: Message) -> None:
         await message.answer("You are not in the system.")
         return
 
-    current = json.loads(row.settings).get("confirmation", "auto")
+    s = json.loads(row.settings)
+    current = s.get("confirmation", "auto")
+    enrich = s.get("enrich", False)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(
                 text=f"{'✓ ' if current == m else ''}{m}", callback_data=f"set_conf:{m}"
             )
             for m in ("off", "auto", "on")
-        ]
+        ],
+        [
+            InlineKeyboardButton(
+                text=f"{'✓ ' if enrich == v else ''}album metadata {'on' if v else 'off'}",
+                callback_data=f"set_enrich:{'on' if v else 'off'}",
+            )
+            for v in (False, True)
+        ],
     ])
     await message.answer(
         "Confirmation mode for metadata search:\n"
         "  — off: don't ask anything\n"
         "  — auto: ask only when no exact matches found\n"
-        "  — on: ask even if exact match is found",
+        "  — on: ask even if exact match is found\n\n"
+        "Album metadata fetch (album, track number, disc, year):\n"
+        "  — off: faster, tags title and artist only\n"
+        "  — on: slower, adds a MusicBrainz lookup per track",
         reply_markup=keyboard
     )
 
@@ -116,4 +128,27 @@ async def cb_set_confirmation(callback: CallbackQuery) -> None:
         await session.commit()
 
     await callback.message.edit_text(f"Confirmation mode set to: <b>{mode}</b>", parse_mode="HTML")
+    await safe_answer(callback)
+
+
+@user_router.callback_query(lambda c: c.data and c.data.startswith("set_enrich:"))
+async def cb_set_enrich(callback: CallbackQuery) -> None:
+    choice = callback.data.split(":")[1]
+    if choice not in ("on", "off"):
+        await safe_answer(callback, "Invalid option")
+        return
+
+    tg_id = callback.from_user.id
+    async with get_session() as session:
+        result = await session.exec(select(User).where(User.tg_id == tg_id))
+        row = result.first()
+        if not row:
+            await safe_answer(callback, "Not found")
+            return
+        s = json.loads(row.settings)
+        s["enrich"] = choice == "on"
+        row.settings = json.dumps(s)
+        await session.commit()
+
+    await callback.message.edit_text(f"Album metadata fetch: <b>{choice}</b>", parse_mode="HTML")
     await safe_answer(callback)

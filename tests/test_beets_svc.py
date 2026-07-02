@@ -254,6 +254,30 @@ def test_apply_and_move_sync_falls_back_to_recording_level(tmp_path):
     raw_match.item.write.assert_called_once_with(path=str(audio))
 
 
+def test_apply_and_move_sync_skips_enrichment_when_disabled(tmp_path):
+    audio = tmp_path / "song.mp3"
+    audio.write_bytes(b"audio data")
+
+    proposal, raw_match = _make_proposal()
+    moved_path = tmp_path / ".pool" / "half·alive" / "05 - still feel..mp3"
+    raw_match.item.path = str(moved_path)
+
+    candidate = Candidate(
+        index=0, artist="half·alive", title="still feel.", album="",
+        year=None, mb_track_id="rec-1", distance=0.05, _match=raw_match,
+    )
+
+    with (
+        patch("src.beets_svc._lib", MagicMock()),
+        patch("src.beets_svc._enrich_from_release") as enrich,
+    ):
+        _apply_and_move_sync(audio, candidate, enrich=False)
+
+    enrich.assert_not_called()
+    raw_match.apply_metadata.assert_called_once()
+    raw_match.item.update.assert_not_called()
+
+
 def test_move_as_is_sync(tmp_path):
     audio = tmp_path / "song.mp3"
     audio.write_bytes(b"audio data")
