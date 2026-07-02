@@ -53,6 +53,18 @@ lowest recording id so the choice is deterministic across uploads. This applies
 to every match, including strong ones, so even auto-imports pick the canonical
 recording.
 
+### Release enrichment
+
+A MusicBrainz recording carries only track-level metadata (title, artist) -- it
+is not tied to any release, so it has no album, track number, disc, or year. Once
+a candidate is chosen, muvult resolves it to a specific release and pulls full
+album metadata from there. The release is picked, in order, by: official status;
+a primary artist matching the track's (over "Various Artists" compilations); a
+studio album (no secondary types, with album over EP over single); a worldwide
+release; earliest date; then lowest release id. The year comes from the
+recording's earliest official release. If any of this fails the track still
+imports, with recording-level tags only.
+
 ### Confirmation modes
 
 Each user picks how much the bot asks before importing (via `/settings`); the
@@ -96,6 +108,7 @@ Configuration is read from the environment (see `.env.example`):
 | `ND_MUSIC_PATH` | Path prefix Navidrome uses for per-user library paths        |
 | `MUSIC_ROOT`    | Library root inside the container (default `/music`)         |
 | `STAGING_ROOT`  | Temp download area inside the container (default `/staging`) |
+| `MB_SEARCH_LIMIT` | MusicBrainz search results fetched per lookup (default 8)  |
 
 ## Deployment
 
