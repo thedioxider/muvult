@@ -26,6 +26,7 @@ class Settings(BaseSettings):
 
     music_root: str = "/music"
     staging_root: str = "/staging"
+    mb_search_limit: int = 8
 
     @field_validator("admin_tg_ids", mode="before")
     @classmethod

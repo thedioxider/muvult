@@ -25,12 +25,12 @@ _lib: Library | None = None
 _beets_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="beets")
 
 
-def setup_beets(music_root: str) -> None:
+def setup_beets(music_root: str, search_limit: int = 8) -> None:
     global _lib
     pool_path = str(Path(music_root) / ".pool")
     beets_config.read(user=False, defaults=True)
     beets_config["plugins"].set(["musicbrainz"])
-    beets_config["musicbrainz"]["search_limit"].set(10)
+    beets_config["musicbrainz"]["search_limit"].set(search_limit)
     plugins.load_plugins()
     from .beets_patches import patch_mb_search
     patch_mb_search()
