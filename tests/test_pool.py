@@ -1,6 +1,12 @@
 from pathlib import Path
 import pytest
-from src.pool import create_symlink, remove_symlink, remove_pool_file, update_symlinks
+from src.pool import (
+    create_symlink,
+    promote_pool_file,
+    remove_symlink,
+    remove_pool_file,
+    update_symlinks,
+)
 
 
 @pytest.fixture
@@ -43,6 +49,31 @@ def test_remove_pool_file(dirs):
     remove_pool_file(pool_file)
 
     assert not pool_file.exists()
+
+
+def test_promote_pool_file_moves_staged_onto_canonical(dirs):
+    pool_dir, user_dir, root = dirs
+    dest = pool_dir / "01 - Song.mp3"
+    dest.write_bytes(b"OLD")
+    staged = pool_dir / ".incoming-abc-01 - Song.mp3"
+    staged.write_bytes(b"NEW")
+
+    result = promote_pool_file(staged, dest)
+
+    assert result == dest
+    assert dest.read_bytes() == b"NEW"
+    assert not staged.exists()
+
+
+def test_promote_pool_file_noop_when_already_canonical(dirs):
+    pool_dir, user_dir, root = dirs
+    dest = pool_dir / "01 - Song.mp3"
+    dest.write_bytes(b"DATA")
+
+    result = promote_pool_file(dest, dest)
+
+    assert result == dest
+    assert dest.read_bytes() == b"DATA"
 
 
 def test_update_symlinks(dirs):

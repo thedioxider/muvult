@@ -10,10 +10,10 @@ from aiogram import Bot, Router
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from sqlmodel import select
 
-from ..beets_svc import get_candidates, apply_and_move, move_as_is
+from ..beets_svc import get_candidates, apply_and_stage, stage_as_is
 from ..db import Track, TrackOwnership, User, get_session
 from ..models import ConfirmationMode, FileStatus, TagResult
-from ..pool import create_symlink, pool_rel, remove_pool_file, update_symlinks
+from ..pool import create_symlink, pool_rel, promote_pool_file, remove_pool_file, update_symlinks
 from ..quality import is_better
 from ..tg_utils import safe_answer
 
@@ -215,20 +215,20 @@ async def _process_file(
 
         is_asis = chosen_index == "asis"
         if is_asis:
-            pool_file = await move_as_is(file_path, db_user.username)
+            staged, dest = await stage_as_is(file_path, db_user.username)
             mb_id = None
         else:
             candidate = tag_result.candidates[int(chosen_index)]
-            pool_file = await apply_and_move(file_path, candidate, enrich)
+            staged, dest = await apply_and_stage(file_path, candidate, enrich)
             mb_id = candidate.mb_track_id
 
         from beets import mediafile as mf_lib
         try:
-            mf = mf_lib.MediaFile(str(pool_file))
+            mf = mf_lib.MediaFile(str(staged))
             new_bitrate = mf.bitrate // 1000 if mf.bitrate else 0
-            new_format = pool_file.suffix.lstrip(".")
+            new_format = staged.suffix.lstrip(".")
         except Exception:
-            new_bitrate, new_format = 0, pool_file.suffix.lstrip(".")
+            new_bitrate, new_format = 0, staged.suffix.lstrip(".")
 
         note = ""
         pool_root = Path(settings.music_root) / ".pool"
@@ -236,30 +236,39 @@ async def _process_file(
             if mb_id:
                 result = await session.exec(select(Track).where(Track.musicbrainz_id == mb_id))
             else:
-                result = await session.exec(select(Track).where(Track.pool_path == pool_rel(pool_file)))
+                result = await session.exec(select(Track).where(Track.pool_path == pool_rel(dest)))
             existing = result.first()
 
             if existing:
-                if is_better(new_bitrate, new_format, existing.bitrate, existing.format):
-                    own_result = await session.exec(
-                        select(TrackOwnership).where(TrackOwnership.track_id == existing.id)
-                    )
-                    ownerships = own_result.all()
-                    old_links = [Path(o.symlink_path) for o in ownerships]
-                    new_links = update_symlinks(pool_root / existing.pool_path, pool_file, old_links)
-                    remove_pool_file(pool_root / existing.pool_path)
-                    note = f"{existing.format.upper()} {existing.bitrate}kbps → {new_format.upper()} {new_bitrate}kbps"
+                old_pool = pool_root / existing.pool_path
+                is_upgrade = is_better(new_bitrate, new_format, existing.bitrate, existing.format)
+                # A duplicate normally loses to the recorded copy -- unless that
+                # copy is missing (a dangling row), in which case the fresh upload
+                # heals it rather than being discarded.
+                if is_upgrade or not old_pool.exists():
+                    pool_file = promote_pool_file(staged, dest)
+                    if pool_file != old_pool:
+                        own_result = await session.exec(
+                            select(TrackOwnership).where(TrackOwnership.track_id == existing.id)
+                        )
+                        ownerships = own_result.all()
+                        old_links = [Path(o.symlink_path) for o in ownerships]
+                        new_links = update_symlinks(old_pool, pool_file, old_links)
+                        remove_pool_file(old_pool)
+                        for ownership, new_l in zip(ownerships, new_links):
+                            ownership.symlink_path = str(new_l)
+                    if is_upgrade:
+                        note = f"{existing.format.upper()} {existing.bitrate}kbps → {new_format.upper()} {new_bitrate}kbps"
                     existing.pool_path = pool_rel(pool_file)
                     existing.bitrate = new_bitrate
                     existing.format = new_format
-                    for ownership, new_l in zip(ownerships, new_links):
-                        ownership.symlink_path = str(new_l)
                     track_id = existing.id
                 else:
-                    remove_pool_file(pool_file)
-                    pool_file = pool_root / existing.pool_path
+                    staged.unlink(missing_ok=True)  # drop the staged copy; canonical stays
+                    pool_file = old_pool
                     track_id = existing.id
             else:
+                pool_file = promote_pool_file(staged, dest)
                 track = Track(
                     pool_path=pool_rel(pool_file), musicbrainz_id=mb_id,
                     format=new_format, bitrate=new_bitrate,

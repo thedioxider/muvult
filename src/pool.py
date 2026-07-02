@@ -1,4 +1,5 @@
 import os
+import shutil
 from pathlib import Path
 
 
@@ -35,6 +36,21 @@ def remove_symlink(symlink_path: Path) -> None:
     if symlink_path.is_symlink():
         symlink_path.unlink()
         _cleanup_empty_parents(symlink_path)
+
+
+def promote_pool_file(staged: Path, dest: Path) -> Path:
+    """Move a staged import onto its canonical pool path, replacing any file there.
+
+    A no-op when ``staged`` already is ``dest`` (nothing collided at tag time).
+    Called only once the caller has decided this copy wins.
+    """
+    if staged == dest:
+        return dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        dest.unlink()
+    shutil.move(str(staged), str(dest))
+    return dest
 
 
 def remove_pool_file(pool_file: Path) -> None:

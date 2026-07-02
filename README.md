@@ -156,7 +156,7 @@ Tests use `pytest-asyncio` (auto mode) and `respx` to mock Navidrome's HTTP API.
 | `src/handlers/upload.py` | File ingest, confirmation flow, dedup, quality upgrade |
 | `src/handlers/admin.py`  | Admin commands + Navidrome library management          |
 | `src/handlers/user.py`   | User commands and settings                             |
-| `src/beets_svc.py`       | beets setup, candidate search, apply/move, as-is move  |
+| `src/beets_svc.py`       | beets setup, candidate search, tagging + staging        |
 | `src/beets_patches.py`   | MusicBrainz search reshaping patch                     |
 | `src/navidrome.py`       | Navidrome admin API client                             |
 | `src/pool.py`            | Pool paths, symlink create/update/remove               |

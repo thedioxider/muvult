@@ -6,8 +6,8 @@ from src.models import Candidate, TagResult
 from src.beets_svc import (
     _dedup_matches,
     _get_candidates_sync,
-    _apply_and_move_sync,
-    _move_as_is_sync,
+    _apply_and_stage_sync,
+    _stage_as_is_sync,
     select_release,
     earliest_official_year,
 )
@@ -207,8 +207,8 @@ def test_apply_and_move_sync_writes_enriched_metadata(tmp_path):
     audio.write_bytes(b"audio data")
 
     proposal, raw_match = _make_proposal()
-    moved_path = tmp_path / ".pool" / "half·alive" / "Now, Not Yet" / "05 - still feel..mp3"
-    raw_match.item.path = str(moved_path)
+    dest_path = tmp_path / ".pool" / "half·alive" / "Now, Not Yet" / "05 - still feel..mp3"
+    raw_match.item.destination.return_value = str(dest_path)
 
     candidate = Candidate(
         index=0, artist="half·alive", title="still feel.", album="",
@@ -220,14 +220,48 @@ def test_apply_and_move_sync_writes_enriched_metadata(tmp_path):
         patch("src.beets_svc._lib", MagicMock()),
         patch("src.beets_svc._enrich_from_release", return_value=enriched),
     ):
-        dest = _apply_and_move_sync(audio, candidate)
+        staged, dest = _apply_and_stage_sync(audio, candidate)
 
     raw_match.item.update.assert_called_once_with(enriched)
     raw_match.apply_metadata.assert_not_called()
     raw_match.item.write.assert_called_once_with(path=str(audio))
     raw_match.item.add.assert_called_once()
-    raw_match.item.move.assert_called_once_with(store=True)
-    assert dest == moved_path
+    raw_match.item.move.assert_not_called()  # placement is deferred to the caller
+    assert staged == audio  # tagged in place, still in staging
+    assert dest == dest_path
+
+
+def test_apply_and_stage_sync_never_touches_the_pool(tmp_path):
+    # A re-upload whose tags map onto an existing canonical pool file must not
+    # touch the pool at all: staging returns where the file *would* go, leaving
+    # both the canonical file and the pool untouched until the caller promotes.
+    pool = tmp_path / ".pool" / "half·alive" / "Now, Not Yet"
+    pool.mkdir(parents=True)
+    canonical = pool / "05 - still feel..mp3"
+    canonical.write_bytes(b"ORIGINAL POOL FILE")
+
+    audio = tmp_path / "staging" / "song.mp3"
+    audio.parent.mkdir()
+    audio.write_bytes(b"NEW UPLOAD")
+
+    proposal, raw_match = _make_proposal()
+    raw_match.item.destination.return_value = str(canonical)
+
+    candidate = Candidate(
+        index=0, artist="half·alive", title="still feel.", album="",
+        year=None, mb_track_id="rec-1", distance=0.05, _match=raw_match,
+    )
+
+    with (
+        patch("src.beets_svc._lib", MagicMock()),
+        patch("src.beets_svc._enrich_from_release", return_value={"album": "Now, Not Yet"}),
+    ):
+        staged, dest = _apply_and_stage_sync(audio, candidate)
+
+    assert dest == canonical
+    assert staged == audio  # stays in staging, not moved into the pool
+    assert canonical.read_bytes() == b"ORIGINAL POOL FILE"  # untouched
+    assert list(pool.iterdir()) == [canonical]  # no temp file created in the pool
 
 
 def test_apply_and_move_sync_falls_back_to_recording_level(tmp_path):
@@ -235,8 +269,7 @@ def test_apply_and_move_sync_falls_back_to_recording_level(tmp_path):
     audio.write_bytes(b"audio data")
 
     proposal, raw_match = _make_proposal()
-    moved_path = tmp_path / ".pool" / "unmatched.mp3"
-    raw_match.item.path = str(moved_path)
+    raw_match.item.destination.return_value = str(tmp_path / ".pool" / "unmatched.mp3")
 
     candidate = Candidate(
         index=0, artist="A", title="B", album="", year=None,
@@ -247,7 +280,7 @@ def test_apply_and_move_sync_falls_back_to_recording_level(tmp_path):
         patch("src.beets_svc._lib", MagicMock()),
         patch("src.beets_svc._enrich_from_release", return_value=None),
     ):
-        _apply_and_move_sync(audio, candidate)
+        _apply_and_stage_sync(audio, candidate)
 
     raw_match.apply_metadata.assert_called_once()
     raw_match.item.update.assert_not_called()
@@ -259,8 +292,9 @@ def test_apply_and_move_sync_skips_enrichment_when_disabled(tmp_path):
     audio.write_bytes(b"audio data")
 
     proposal, raw_match = _make_proposal()
-    moved_path = tmp_path / ".pool" / "half·alive" / "05 - still feel..mp3"
-    raw_match.item.path = str(moved_path)
+    raw_match.item.destination.return_value = str(
+        tmp_path / ".pool" / "half·alive" / "05 - still feel..mp3"
+    )
 
     candidate = Candidate(
         index=0, artist="half·alive", title="still feel.", album="",
@@ -271,14 +305,14 @@ def test_apply_and_move_sync_skips_enrichment_when_disabled(tmp_path):
         patch("src.beets_svc._lib", MagicMock()),
         patch("src.beets_svc._enrich_from_release") as enrich,
     ):
-        _apply_and_move_sync(audio, candidate, enrich=False)
+        _apply_and_stage_sync(audio, candidate, enrich=False)
 
     enrich.assert_not_called()
     raw_match.apply_metadata.assert_called_once()
     raw_match.item.update.assert_not_called()
 
 
-def test_move_as_is_sync(tmp_path):
+def test_stage_as_is_sync(tmp_path):
     audio = tmp_path / "song.mp3"
     audio.write_bytes(b"audio data")
 
@@ -287,16 +321,37 @@ def test_move_as_is_sync(tmp_path):
     mock_lib.directory = str(lib_dir).encode()
 
     with patch("src.beets_svc._lib", mock_lib):
-        dest = _move_as_is_sync(audio, "alice")
+        staged, dest = _stage_as_is_sync(audio, "alice")
 
     expected = lib_dir / "users" / "alice" / "song.mp3"
     assert dest == expected
-    assert dest.is_file()
-    assert dest.read_bytes() == b"audio data"
-    assert not audio.exists()  # moved, not copied
+    assert staged == audio  # not moved; still in staging until promoted
+    assert staged.read_bytes() == b"audio data"
+    assert audio.exists()
 
 
-def test_move_as_is_sync_rejects_path_traversal(tmp_path):
+def test_stage_as_is_sync_never_touches_the_pool(tmp_path):
+    lib_dir = tmp_path / ".pool"
+    canonical = lib_dir / "users" / "alice" / "song.mp3"
+    canonical.parent.mkdir(parents=True)
+    canonical.write_bytes(b"ORIGINAL")
+
+    audio = tmp_path / "staging" / "song.mp3"
+    audio.parent.mkdir()
+    audio.write_bytes(b"NEW")
+
+    mock_lib = MagicMock()
+    mock_lib.directory = str(lib_dir).encode()
+
+    with patch("src.beets_svc._lib", mock_lib):
+        staged, dest = _stage_as_is_sync(audio, "alice")
+
+    assert dest == canonical
+    assert staged == audio
+    assert canonical.read_bytes() == b"ORIGINAL"  # untouched
+
+
+def test_stage_as_is_sync_rejects_path_traversal(tmp_path):
     audio = tmp_path / "song.mp3"
     audio.write_bytes(b"audio data")
 
@@ -305,4 +360,4 @@ def test_move_as_is_sync_rejects_path_traversal(tmp_path):
 
     with patch("src.beets_svc._lib", mock_lib):
         with pytest.raises(ValueError, match="path traversal"):
-            _move_as_is_sync(audio, "../escape")
+            _stage_as_is_sync(audio, "../escape")

@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import os
-import shutil
 from asyncio import get_running_loop
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -106,9 +105,11 @@ def _get_candidates_sync(file_path: Path) -> TagResult:
     return TagResult(candidates=candidates, recommendation=int(proposal.recommendation))
 
 
-async def apply_and_move(file_path: Path, candidate: Candidate, enrich: bool = True) -> Path:
+async def apply_and_stage(
+    file_path: Path, candidate: Candidate, enrich: bool = True
+) -> tuple[Path, Path]:
     loop = get_running_loop()
-    return await loop.run_in_executor(_beets_pool, _apply_and_move_sync, file_path, candidate, enrich)
+    return await loop.run_in_executor(_beets_pool, _apply_and_stage_sync, file_path, candidate, enrich)
 
 
 def _status_rank(status: str | None) -> int:
@@ -230,7 +231,17 @@ def _enrich_from_release(match) -> dict | None:
         return None
 
 
-def _apply_and_move_sync(file_path: Path, candidate: Candidate, enrich: bool = True) -> Path:
+def _apply_and_stage_sync(
+    file_path: Path, candidate: Candidate, enrich: bool = True
+) -> tuple[Path, Path]:
+    """Tag the file in place (in staging) and report where it should be filed.
+
+    Returns ``(staged, dest)``: ``staged`` is the tagged file, still in staging;
+    ``dest`` is the canonical pool path its tags map to. Nothing is written into
+    the pool here -- the caller moves ``staged`` onto ``dest`` (``promote_pool_file``)
+    only once dedup decides this copy wins, so an existing pool file is never at
+    risk before that decision, and a discarded upload leaves no pool litter.
+    """
     match = candidate._match
     item = match.item
     enriched = _enrich_from_release(match) if enrich else None
@@ -239,26 +250,21 @@ def _apply_and_move_sync(file_path: Path, candidate: Candidate, enrich: bool = T
     else:
         match.apply_metadata()  # recording-level only; no album/track/disc/year
     item.write(path=str(file_path))
-    item.add(_lib)
+    item.add(_lib)  # gives the item the library dir/path-formats destination() needs
     dest = Path(os.fsdecode(item.destination()))
-    if dest.exists():
-        dest.unlink()
-    item.move(store=True)
-    return Path(os.fsdecode(item.path))
+    return file_path, dest
 
 
-async def move_as_is(file_path: Path, username: str) -> Path:
+async def stage_as_is(file_path: Path, username: str) -> tuple[Path, Path]:
     loop = get_running_loop()
-    return await loop.run_in_executor(_beets_pool, _move_as_is_sync, file_path, username)
+    return await loop.run_in_executor(_beets_pool, _stage_as_is_sync, file_path, username)
 
 
-def _move_as_is_sync(file_path: Path, username: str) -> Path:
+def _stage_as_is_sync(file_path: Path, username: str) -> tuple[Path, Path]:
+    """As-is counterpart to ``_apply_and_stage_sync``: validate and report the
+    per-user pool path without moving anything (placement is the caller's job)."""
     users_root = (Path(os.fsdecode(_lib.directory)) / "users").resolve()
     dest = (users_root / username / file_path.name).resolve()
     if not dest.is_relative_to(users_root):
         raise ValueError(f"path traversal detected for username {username!r}")
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    if dest.exists():
-        dest.unlink()
-    shutil.move(str(file_path), str(dest))
-    return dest
+    return file_path, dest
