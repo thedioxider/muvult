@@ -39,6 +39,20 @@ carrying extra tokens like `(Album Version)`. muvult patches the search into a
 more robust shape (`+artist:(…) +(recording:(…) alias:(…)) release:(…)`) --
 required identity fields, forgiving on description, album as an optional boost.
 
+### Candidate deduplication
+
+MusicBrainz frequently holds several recording entities for one performance --
+typically one per release of the same album -- differing only in trivia: a
+sub-second length delta, an ISRC, or which release they hang off. Presented
+raw, the candidate list shows the same song several times, indistinguishable to
+the user. muvult collapses these: candidates sharing artist, title, and
+displayed duration (whole seconds) are grouped, and one representative is kept.
+The survivor is chosen by, in order, best beets match (lowest distance), then
+carrying an ISRC (the canonically-registered, usually worldwide recording), then
+lowest recording id so the choice is deterministic across uploads. This applies
+to every match, including strong ones, so even auto-imports pick the canonical
+recording.
+
 ### Confirmation modes
 
 Each user picks how much the bot asks before importing (via `/settings`); the
