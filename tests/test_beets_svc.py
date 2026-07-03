@@ -312,6 +312,56 @@ def test_apply_and_stage_sync_writes_recording_then_enriched(tmp_path):
     assert dest == dest_path
 
 
+def test_apply_and_stage_sync_enriches_with_file_length_not_recording_length(tmp_path):
+    # track_info carries the *recording* length, and item.update overwrites
+    # item.length with it. Enrichment's length tiebreak must still see the file's
+    # own duration -- otherwise a recording length that matches a vinyl edition's
+    # track pulls the track onto that edition (the ok-ok split).
+    audio = tmp_path / "song.mp3"
+    audio.write_bytes(b"audio data")
+    dest = tmp_path / ".pool" / "x.mp3"
+    item, plugin, rec = _mk_apply_mocks(dest, track_data={"title": "ok ok?", "length": 228.0})
+    item.length = 228.533  # the file's true duration
+
+    def _overwrite(data):  # mimic Item.update copying length out of the tags
+        if "length" in data:
+            item.length = data["length"]
+    item.update.side_effect = _overwrite
+
+    candidate = Candidate(
+        index=0, artist="half·alive", title="ok ok?", album="",
+        year=None, mb_track_id="rec-1", distance=0.0, _match=MagicMock(),
+    )
+
+    with (
+        patch("src.beets_svc.Item.from_path", return_value=item),
+        patch("src.beets_svc._get_recording_full", return_value=rec),
+        patch("src.beets_svc._mb_plugin", return_value=plugin),
+        patch("src.beets_svc._enrich_from_release", return_value={"album": "Now, Not Yet"}) as enrich,
+        patch("src.beets_svc._lib", MagicMock()),
+    ):
+        _apply_and_stage_sync(audio, candidate)
+
+    assert enrich.call_args.args[3] == 228.533  # file duration, not the 228.0 recording length
+
+
+def test_select_release_rounds_length_to_seconds(tmp_path):
+    # A digital edition (ms-precise track length) and a vinyl edition (second-
+    # granular) of the same album: a sub-second delta must not split the track onto
+    # the vinyl. File 228.533s -> both round to 229/228s; the vinyl's exact 228000
+    # must not beat the digital on a raw-ms delta.
+    from src.beets_svc import select_release
+
+    digital = {"id": "digital", "status": "Official", "country": "XW",
+               "release_group": {"primary_type": "Album"},
+               "media": [{"track": [{"length": 228542}]}]}
+    vinyl = {"id": "vinyl", "status": "Official", "country": None,
+             "release_group": {"primary_type": "Album"},
+             "media": [{"track": [{"length": 228000}]}]}
+    chosen = select_release([vinyl, digital], "half·alive", 228533)
+    assert chosen["id"] == "digital"
+
+
 def test_apply_and_stage_sync_never_touches_the_pool(tmp_path):
     # A re-upload whose tags map onto an existing canonical pool file must not
     # touch the pool at all: staging returns where the file *would* go, leaving

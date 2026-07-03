@@ -200,10 +200,13 @@ def select_release(
         return None
 
     def length_delta(r: dict) -> float:
+        # Compare at whole-second granularity: MusicBrainz records vinyl/CD track
+        # times to the second while digital editions carry millisecond precision,
+        # so a sub-second delta must not decide which edition a track lands on.
         if file_length_ms is None:
             return 0.0  # no signal: leave ordering to the other criteria
         tl = _release_track_length_ms(r)
-        return abs(tl - file_length_ms) if tl is not None else float("inf")
+        return abs(round(tl / 1000) - round(file_length_ms / 1000)) if tl is not None else float("inf")
 
     def key(r: dict) -> tuple:
         return (
@@ -326,6 +329,10 @@ def _apply_and_stage_sync(
     (``promote_pool_file``) only once dedup decides this copy wins.
     """
     item = Item.from_path(str(file_path))
+    # The file's own duration, captured before item.update overwrites item.length
+    # with the *recording* length -- enrichment's length tiebreak must compare the
+    # release track lengths against the actual file, not the recording.
+    file_length = item.length
     rec = _get_recording_full(candidate.mb_track_id) if candidate.mb_track_id else None
     if rec is not None:
         plugin = _mb_plugin()
@@ -340,7 +347,7 @@ def _apply_and_stage_sync(
         releases = []
     if enrich and releases:
         enriched = _enrich_from_release(
-            releases, candidate.mb_track_id, track_artist, item.length
+            releases, candidate.mb_track_id, track_artist, file_length
         )
         if enriched is not None:
             item.update(enriched)
