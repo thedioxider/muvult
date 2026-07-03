@@ -54,6 +54,25 @@ _STATUS_LABELS = {
 _TERMINAL = {FileStatus.IMPORTED, FileStatus.SKIPPED, FileStatus.DUPLICATE, FileStatus.FAILED}
 
 
+async def _find_existing_track(session, mb_id: str | None, pool_path: str):
+    """Locate the Track a staged upload maps onto.
+
+    Prefer the recording id; fall back to the canonical pool path. A re-upload that
+    now resolves to a *different* recording id (e.g. after a better MB match) still
+    lands on the row already occupying its path -- which is unique -- so we replace
+    that row in place instead of inserting a duplicate that would collide. Because
+    the path carries the track disambiguation, a genuinely different recording of
+    the same track (a live take) resolves to a different path and never adopts the
+    wrong row.
+    """
+    if mb_id:
+        result = await session.exec(select(Track).where(Track.musicbrainz_id == mb_id))
+        if (existing := result.first()) is not None:
+            return existing
+    result = await session.exec(select(Track).where(Track.pool_path == pool_path))
+    return result.first()
+
+
 @dataclass
 class FileState:
     original_name: str
@@ -233,11 +252,7 @@ async def _process_file(
         note = ""
         pool_root = Path(settings.music_root) / ".pool"
         async with get_session() as session:
-            if mb_id:
-                result = await session.exec(select(Track).where(Track.musicbrainz_id == mb_id))
-            else:
-                result = await session.exec(select(Track).where(Track.pool_path == pool_rel(dest)))
-            existing = result.first()
+            existing = await _find_existing_track(session, mb_id, pool_rel(dest))
 
             if existing:
                 old_pool = pool_root / existing.pool_path
@@ -265,6 +280,7 @@ async def _process_file(
                     if is_upgrade:
                         note = f"{existing.format.upper()} {existing.bitrate}kbps → {new_format.upper()} {new_bitrate}kbps"
                     existing.pool_path = pool_rel(pool_file)
+                    existing.musicbrainz_id = mb_id  # may have changed (better MB match)
                     existing.bitrate = new_bitrate
                     existing.format = new_format
                     track_id = existing.id

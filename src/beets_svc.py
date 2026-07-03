@@ -18,15 +18,12 @@ log = logging.getLogger(__name__)
 _BEETS_DB = "/data/beets_pool.db"
 _lib: Library | None = None
 
-# Disambiguation goes into the pool path so genuinely-distinct versions never share
-# a canonical location: album disambig (edition) on the folder -- shared by all its
-# tracks so the album stays together -- and track disambig (e.g. "live") on the file.
-# Both are absent for plain releases, so ordinary albums keep the bare
-# `$albumartist/$album/$track - $title` and existing pool files are undisturbed.
-_PATH_FORMAT = (
-    "$albumartist/$album%if{$albumdisambig, ($albumdisambig)}"
-    "/$track - $title%if{$trackdisambig, ($trackdisambig)}"
-)
+# Track disambiguation (e.g. "live") goes into the filename so a distinct recording
+# of the same track gets a distinct canonical path. Track number and album version
+# are deliberately excluded: the number is positional (MB renumbers/renumerates)
+# and the true dedup key is the recording id, not the path; album version splits
+# nothing the recording id doesn't already merge.
+_PATH_FORMAT = "$albumartist/$album/$title%if{$trackdisambig, ($trackdisambig)}"
 
 # All beets work runs on a single thread: MusicBrainz is rate-limited to 1 req/s
 # so parallel tagging only contends, and the shared beets Library (one sqlite

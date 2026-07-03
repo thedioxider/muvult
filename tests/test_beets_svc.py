@@ -547,10 +547,10 @@ def _dest_for(lib, **fields):
     return os.fsdecode(it.destination())
 
 
-def test_path_format_appends_disambiguation(tmp_path):
-    # A plain release keeps the bare path; an edition disambig lands on the album
-    # folder and a track disambig on the filename, so distinct versions get
-    # distinct canonical paths.
+def test_path_format_track_disambig_only(tmp_path):
+    # The path is albumartist/album/title, with only a track disambiguation
+    # appended. Track number and album version are excluded, so they don't affect
+    # the canonical location.
     from beets import config as beets_config
     from beets.library import Library
     from src.beets_svc import _PATH_FORMAT
@@ -561,10 +561,14 @@ def test_path_format_appends_disambiguation(tmp_path):
     lib = Library(str(tmp_path / "b.db"), directory=str(tmp_path / "pool"))
 
     plain = _dest_for(lib, albumartist="Artist", album="Album", track=7, title="Song")
-    assert plain.endswith("Artist/Album/07 - Song")
+    assert plain.endswith("Artist/Album/Song")
 
-    versioned = _dest_for(
+    # album version does not change the path; only a track disambig does
+    edition = _dest_for(
         lib, albumartist="Artist", album="Album", albumdisambig="deluxe edition",
-        track=7, title="Song", trackdisambig="live",
+        track=3, title="Song",
     )
-    assert versioned.endswith("Artist/Album (deluxe edition)/07 - Song (live)")
+    assert edition.endswith("Artist/Album/Song")
+
+    live = _dest_for(lib, albumartist="Artist", album="Album", title="Song", trackdisambig="live")
+    assert live.endswith("Artist/Album/Song (live)")

@@ -17,9 +17,9 @@ MusicBrainz (through beets), then filed into a shared pool and linked into the
 uploader's library:
 
 - **Pool** -- `<music root>/.pool/` holds exactly one file per track, named
-  `$albumartist/$album/$track - $title`, with any edition/version disambiguation
-  folded into the path (`Album (deluxe edition)/07 - arrow (live)`) so distinct
-  versions never share a location. This is the only real copy.
+  `$albumartist/$album/$title`, with a track disambiguation folded in when present
+  (`.../arrow (live)`) so a distinct recording of the same track gets its own
+  location. This is the only real copy.
 - **Libraries** -- each user has a directory `<music root>/<username>/`
   containing _symlinks_ into the pool. Navidrome scans these per-user dirs, one
   library per user (its path is `ND_MUSIC_PATH/<username>`).
