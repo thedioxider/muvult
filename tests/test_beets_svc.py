@@ -132,6 +132,16 @@ def test_dedup_keeps_isrc_on_distance_tie():
     assert [m.info.track_id for m in result] == ["bbb"]
 
 
+def test_dedup_isrc_beats_lower_distance():
+    # ISRC presence takes priority over length: the ISRC recording wins even when a
+    # non-ISRC take has a better (lower) distance.
+    matches = [
+        _mk_match("A", "T", 100.0, None, "x", 0.01),
+        _mk_match("A", "T", 100.0, "USRC11901785", "y", 0.20),
+    ]
+    assert [m.info.track_id for m in _dedup_matches(matches)] == ["y"]
+
+
 def test_dedup_lower_distance_wins():
     matches = [
         _mk_match("A", "T", 100.0, None, "x", 0.05),
@@ -345,21 +355,27 @@ def test_apply_and_stage_sync_enriches_with_file_length_not_recording_length(tmp
     assert enrich.call_args.args[3] == 228.533  # file duration, not the 228.0 recording length
 
 
-def test_select_release_rounds_length_to_seconds(tmp_path):
-    # A digital edition (ms-precise track length) and a vinyl edition (second-
-    # granular) of the same album: a sub-second delta must not split the track onto
-    # the vinyl. File 228.533s -> both round to 229/228s; the vinyl's exact 228000
-    # must not beat the digital on a raw-ms delta.
-    from src.beets_svc import select_release
-
-    digital = {"id": "digital", "status": "Official", "country": "XW",
-               "release_group": {"primary_type": "Album"},
-               "media": [{"track": [{"length": 228542}]}]}
+def test_select_release_country_outranks_length():
+    # ok-ok case: the worldwide edition wins over a countryless one even though the
+    # latter's track length matches the file exactly -- country ranks above length.
+    worldwide = {"id": "digital", "status": "Official", "country": "XW",
+                 "release_group": {"primary_type": "Album"},
+                 "media": [{"track": [{"length": 228542}]}]}
     vinyl = {"id": "vinyl", "status": "Official", "country": None,
              "release_group": {"primary_type": "Album"},
              "media": [{"track": [{"length": 228000}]}]}
-    chosen = select_release([vinyl, digital], "half·alive", 228533)
-    assert chosen["id"] == "digital"
+    assert select_release([vinyl, worldwide], "half·alive", 228000)["id"] == "digital"
+
+
+def test_select_release_length_tiebreak_is_millisecond():
+    # Same status/artist/type/country: length decides, at millisecond precision.
+    # File 228.400s is nearer b (228.600) than a (228.000) by ms; a whole-second
+    # rounding would have flipped it to a (228 vs 229).
+    a = _rel("r-a", "Album", "Album", [], "Official", "2019", "XW")
+    b = _rel("r-b", "Album", "Album", [], "Official", "2019", "XW")
+    a["media"] = [{"track": [{"length": 228000}]}]
+    b["media"] = [{"track": [{"length": 228600}]}]
+    assert select_release([a, b], "half•alive", 228400)["id"] == "r-b"
 
 
 def test_apply_and_stage_sync_never_touches_the_pool(tmp_path):
@@ -521,3 +537,34 @@ def test_stage_as_is_sync_rejects_path_traversal(tmp_path):
     with patch("src.beets_svc._lib", mock_lib):
         with pytest.raises(ValueError, match="path traversal"):
             _stage_as_is_sync(audio, "../escape")
+
+
+def _dest_for(lib, **fields):
+    from beets.library.models import Item
+    it = Item(format="MP3", **fields)
+    it.add(lib)
+    import os
+    return os.fsdecode(it.destination())
+
+
+def test_path_format_appends_disambiguation(tmp_path):
+    # A plain release keeps the bare path; an edition disambig lands on the album
+    # folder and a track disambig on the filename, so distinct versions get
+    # distinct canonical paths.
+    from beets import config as beets_config
+    from beets.library import Library
+    from src.beets_svc import _PATH_FORMAT
+
+    beets_config.read(user=False, defaults=True)
+    beets_config["asciify_paths"].set(True)
+    beets_config["paths"]["singleton"].set(_PATH_FORMAT)
+    lib = Library(str(tmp_path / "b.db"), directory=str(tmp_path / "pool"))
+
+    plain = _dest_for(lib, albumartist="Artist", album="Album", track=7, title="Song")
+    assert plain.endswith("Artist/Album/07 - Song")
+
+    versioned = _dest_for(
+        lib, albumartist="Artist", album="Album", albumdisambig="deluxe edition",
+        track=7, title="Song", trackdisambig="live",
+    )
+    assert versioned.endswith("Artist/Album (deluxe edition)/07 - Song (live)")

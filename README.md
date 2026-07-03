@@ -17,7 +17,9 @@ MusicBrainz (through beets), then filed into a shared pool and linked into the
 uploader's library:
 
 - **Pool** -- `<music root>/.pool/` holds exactly one file per track, named
-  `$albumartist/$album/$track - $title`. This is the only real copy.
+  `$albumartist/$album/$track - $title`, with any edition/version disambiguation
+  folded into the path (`Album (deluxe edition)/07 - arrow (live)`) so distinct
+  versions never share a location. This is the only real copy.
 - **Libraries** -- each user has a directory `<music root>/<username>/`
   containing _symlinks_ into the pool. Navidrome scans these per-user dirs, one
   library per user (its path is `ND_MUSIC_PATH/<username>`).
@@ -64,11 +66,11 @@ typically one per release of the same album -- differing only in trivia: a lengt
 delta, an ISRC, or which release they hang off. Presented raw, the candidate list
 shows the same song several times, indistinguishable to the user. muvult collapses
 these: candidates sharing artist, title, and disambiguation are grouped, and one
-representative is kept. The survivor is chosen by, in order, best beets match
-(lowest corrected distance), then carrying an ISRC (the canonically-registered,
-usually worldwide recording), then lowest recording id so the choice is
-deterministic across uploads. This applies to every match, including strong ones,
-so even auto-imports pick the canonical recording.
+representative is kept. The survivor is chosen by, in order, carrying an ISRC (the
+canonically-registered, usually worldwide recording of the same track), then best
+beets match (lowest corrected distance, i.e. closest length), then lowest recording
+id so the choice is deterministic across uploads. This applies to every match,
+including strong ones, so even auto-imports pick the canonical recording.
 
 ### Release enrichment
 
@@ -78,10 +80,10 @@ enabled, muvult resolves the imported recording to a specific release and pulls
 full album metadata from there. The release is picked, in order, by: official
 status; a primary artist matching the track's (over "Various Artists"
 compilations); a studio album (no secondary types, with album over EP over
-single); the release whose track length is closest to the file; a worldwide
-release; earliest date; then lowest release id. The year comes from the
-recording's earliest official release. If any of this fails the track still
-imports, with recording-level tags only.
+single); a worldwide release; then the release whose track length is closest to
+the file (in milliseconds, against the file's own duration); earliest date; then
+lowest release id. The year comes from the recording's earliest official release.
+If any of this fails the track still imports, with recording-level tags only.
 
 Enrichment reuses the releases from the import lookup (no extra request) and
 caches release lookups by id, so a whole album uploaded at once resolves its

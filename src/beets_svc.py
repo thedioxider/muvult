@@ -18,6 +18,16 @@ log = logging.getLogger(__name__)
 _BEETS_DB = "/data/beets_pool.db"
 _lib: Library | None = None
 
+# Disambiguation goes into the pool path so genuinely-distinct versions never share
+# a canonical location: album disambig (edition) on the folder -- shared by all its
+# tracks so the album stays together -- and track disambig (e.g. "live") on the file.
+# Both are absent for plain releases, so ordinary albums keep the bare
+# `$albumartist/$album/$track - $title` and existing pool files are undisturbed.
+_PATH_FORMAT = (
+    "$albumartist/$album%if{$albumdisambig, ($albumdisambig)}"
+    "/$track - $title%if{$trackdisambig, ($trackdisambig)}"
+)
+
 # All beets work runs on a single thread: MusicBrainz is rate-limited to 1 req/s
 # so parallel tagging only contends, and the shared beets Library (one sqlite
 # file) can hit "database is locked" under concurrent writes. Serializing here
@@ -35,8 +45,8 @@ def setup_beets(music_root: str, search_limit: int = 8) -> None:
     from .beets_patches import patch_mb_search
     patch_mb_search()
     beets_config["asciify_paths"].set(True)
-    beets_config["paths"]["default"].set("$albumartist/$album/$track - $title")
-    beets_config["paths"]["singleton"].set("$albumartist/$album/$track - $title")
+    beets_config["paths"]["default"].set(_PATH_FORMAT)
+    beets_config["paths"]["singleton"].set(_PATH_FORMAT)
     _lib = Library(_BEETS_DB, directory=pool_path)
 
 
@@ -58,17 +68,17 @@ def _dedup_matches(matches: list) -> list:
 
     Within a group the survivor is chosen by, in order:
 
-    - best beets match (lowest corrected distance),
     - carrying an ISRC (the canonically-registered, typically worldwide
-      recording),
-    - lowest MBID, so the choice is deterministic across uploads.
+      recording) -- the authoritative identity of the same track wins outright,
+    - then best beets match (lowest corrected distance, i.e. closest length),
+    - then lowest MBID, so the choice is deterministic across uploads.
 
     Output order follows the input list.
     """
     def rank(m) -> tuple:
         return (
-            m.distance.distance,
             0 if getattr(m.info, "isrc", None) else 1,
+            m.distance.distance,
             m.info.track_id or "",
         )
 
@@ -191,30 +201,29 @@ def select_release(
     """Choose the best release a recording appears on for singleton enrichment.
 
     Strict priority: Official status, then matching primary artist, then studio
-    album, then (when ``file_length_ms`` is known) the release whose track length
-    is closest to the file, then worldwide country, then earliest date (missing
-    last), then lowest release MBID.
+    album, then worldwide country, then (when ``file_length_ms`` is known) the
+    release whose track length is closest to the file, then earliest date (missing
+    last), then lowest release MBID. Length sits below country -- edition identity
+    is a stronger signal than a duration delta -- and is compared in milliseconds
+    as a fine final tiebreak.
     """
     releases = [r for r in releases if r]
     if not releases:
         return None
 
     def length_delta(r: dict) -> float:
-        # Compare at whole-second granularity: MusicBrainz records vinyl/CD track
-        # times to the second while digital editions carry millisecond precision,
-        # so a sub-second delta must not decide which edition a track lands on.
         if file_length_ms is None:
             return 0.0  # no signal: leave ordering to the other criteria
         tl = _release_track_length_ms(r)
-        return abs(round(tl / 1000) - round(file_length_ms / 1000)) if tl is not None else float("inf")
+        return abs(tl - file_length_ms) if tl is not None else float("inf")
 
     def key(r: dict) -> tuple:
         return (
             -_status_rank(r.get("status")),
             -_artist_rank(r, track_artist),
             -_type_rank(r.get("release_group")),
-            length_delta(r),
             -_country_rank(r.get("country")),
+            length_delta(r),
             r.get("date") or "9999",
             r.get("id") or "",
         )
