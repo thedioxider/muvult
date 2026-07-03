@@ -87,8 +87,8 @@ If any of this fails the track still imports, with recording-level tags only.
 
 Enrichment reuses the releases from the import lookup (no extra request) and
 caches release lookups by id, so a whole album uploaded at once resolves its
-shared release just once. It is **off by default** and opt-in per user via
-`/settings` -- with it off, tracks are tagged with title and artist only (any
+shared release just once. It is **on by default** and can be turned off per user
+via `/settings` -- with it off, tracks are tagged with title and artist only (any
 album/track tags already on the file are kept) and import faster.
 
 ### Confirmation modes

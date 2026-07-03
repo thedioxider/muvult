@@ -80,7 +80,7 @@ async def cmd_settings(message: Message) -> None:
 
     s = json.loads(row.settings)
     current = s.get("confirmation", "auto")
-    enrich = s.get("enrich", False)
+    enrich = s.get("enrich", True)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(

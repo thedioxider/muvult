@@ -209,7 +209,7 @@ async def _process_file(
             db_user = result.first()
         user_settings = json.loads(db_user.settings) if db_user else {}
         mode = ConfirmationMode(user_settings.get("confirmation", "auto"))
-        enrich = user_settings.get("enrich", False)
+        enrich = user_settings.get("enrich", True)
 
         is_high = tag_result.recommendation >= 3
         chosen_index: int | str | None = None
