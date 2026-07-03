@@ -24,9 +24,11 @@ uploader's library:
 - **Deduplication** -- a `Track` row is keyed by MusicBrainz recording id (or by
   pool path for as-is imports). Uploading a track someone already owns just adds
   an ownership symlink; no second copy is made.
-- **Quality upgrades** -- when a new upload of an existing track is better
-  (higher bitrate; ties broken by format rank `flac > ogg > aac > mp3`), the
-  pool file is replaced and every owner's symlink is repointed.
+- **Quality upgrades** -- when a new upload of an existing track is at least as
+  good (higher bitrate; ties broken by format rank `flac > ogg > aac > mp3`,
+  equal quality still replacing so a re-upload refreshes tags), the pool file is
+  replaced and every owner's symlink is repointed. Only a strictly worse upload
+  is dropped.
 - **As-is import** -- if MusicBrainz has no match (or the user declines), the
   file is stored unmodified under `.pool/users/<username>/` and linked flatly
   into the library.

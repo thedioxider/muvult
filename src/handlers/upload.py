@@ -242,10 +242,15 @@ async def _process_file(
             if existing:
                 old_pool = pool_root / existing.pool_path
                 is_upgrade = is_better(new_bitrate, new_format, existing.bitrate, existing.format)
-                # A duplicate normally loses to the recorded copy -- unless that
-                # copy is missing (a dangling row), in which case the fresh upload
-                # heals it rather than being discarded.
-                if is_upgrade or not old_pool.exists():
+                # A same-or-better upload replaces the recorded copy (refreshing
+                # tags on a re-upload of equal quality); a strictly worse one
+                # loses -- unless the recorded copy is missing (a dangling row),
+                # in which case even a worse upload heals it instead of being
+                # discarded.
+                replaces = is_better(
+                    new_bitrate, new_format, existing.bitrate, existing.format, or_equal=True
+                )
+                if replaces or not old_pool.exists():
                     pool_file = promote_pool_file(staged, dest)
                     if pool_file != old_pool:
                         own_result = await session.exec(
