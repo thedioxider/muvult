@@ -3,6 +3,7 @@ import logging
 import os
 from asyncio import get_running_loop
 from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from pathlib import Path
 
 from beets import config as beets_config, plugins
@@ -48,38 +49,73 @@ def _dedup_matches(matches: list) -> list:
     """Filter out recordings that are indistinguishable to the user.
 
     MusicBrainz often holds several recording entities for one performance (e.g.
-    one per release of the same album), differing only in trivia -- a sub-second
-    length delta, an ISRC, which release they hang off -- but sharing artist,
-    title, and displayed duration. We keep one representative per
-    (artist, title, seconds) group.
+    one per release of the same album), differing only in trivia -- an ISRC,
+    which release they hang off, a small length delta -- but sharing artist,
+    title, and disambiguation. We keep one representative per
+    (artist, title, disambig) group. (Length is *not* part of the key: candidate
+    lengths are already corrected to the nearest per-release track length before
+    scoring, so two takes of the same track no longer straddle a second boundary.)
 
     Within a group the survivor is chosen by, in order:
 
-    - best beets match (lowest distance),
+    - best beets match (lowest corrected distance),
     - carrying an ISRC (the canonically-registered, typically worldwide
       recording),
     - lowest MBID, so the choice is deterministic across uploads.
 
     Output order follows the input list.
     """
-    keys = [
-        (
-            (m.info.artist or "").lower(),
-            (m.info.title or "").lower(),
-            int(m.info.length) if getattr(m.info, "length", None) else None,
-        )
-        for m in matches
-    ]
-    chosen: dict[tuple, tuple] = {}  # key -> (rank, match)
-    for key, m in zip(keys, matches):
-        rank = (
+    def rank(m) -> tuple:
+        return (
             m.distance.distance,
             0 if getattr(m.info, "isrc", None) else 1,
             m.info.track_id or "",
         )
-        if key not in chosen or rank < chosen[key][0]:
-            chosen[key] = (rank, m)
-    return [m for key, m in zip(keys, matches) if chosen[key][1] is m]
+
+    groups: dict[tuple, list] = {}
+    for m in matches:
+        key = (
+            (m.info.artist or "").lower(),
+            (m.info.title or "").lower(),
+            getattr(m.info, "trackdisambig", None) or "",
+        )
+        groups.setdefault(key, []).append(m)
+
+    keep = {id(min(ms, key=rank)) for ms in groups.values()}
+    return [m for m in matches if id(m) in keep]
+
+
+def _release_track_length_ms(release: dict) -> int | None:
+    """Length (ms) of the recording's own track on this release.
+
+    Search-embedded releases carry only the matching recording's track(s) under
+    ``media -> track/tracks``; take the shortest when several are present.
+    """
+    lens = [
+        t["length"]
+        for medium in (release.get("media") or [])
+        for t in (medium.get("tracks") or medium.get("track") or [])
+        if t.get("length")
+    ]
+    return min(lens) if lens else None
+
+
+def _nearest_release_length(rec: dict, file_length_s: float | None) -> float | None:
+    """Per-release track length (seconds) closest to the file's duration.
+
+    Fixes the singleton blind spot: a recording's own ``length`` can differ from
+    the track's length on the specific release the file came from. Returns None
+    when nothing usable is known, so the caller keeps the recording length.
+    """
+    if not file_length_s:
+        return None
+    target = file_length_s * 1000
+    best: int | None = None
+    for release in rec.get("releases") or []:
+        tl = _release_track_length_ms(release)
+        if tl is not None and (best is None or abs(tl - target) < abs(best - target)):
+            best = tl
+    return best / 1000.0 if best is not None else None
 
 
 def _get_candidates_sync(file_path: Path) -> TagResult:
@@ -147,22 +183,34 @@ def _artist_rank(release: dict, track_artist: str | None) -> int:
     return 1 if _release_artist(release).casefold() == track_artist.casefold() else 0
 
 
-def select_release(releases: list[dict], track_artist: str | None = None) -> dict | None:
+def select_release(
+    releases: list[dict],
+    track_artist: str | None = None,
+    file_length_ms: int | None = None,
+) -> dict | None:
     """Choose the best release a recording appears on for singleton enrichment.
 
     Strict priority: Official status, then matching primary artist, then studio
-    album, then worldwide country, then earliest date (missing last), then lowest
-    release MBID.
+    album, then (when ``file_length_ms`` is known) the release whose track length
+    is closest to the file, then worldwide country, then earliest date (missing
+    last), then lowest release MBID.
     """
     releases = [r for r in releases if r]
     if not releases:
         return None
+
+    def length_delta(r: dict) -> float:
+        if file_length_ms is None:
+            return 0.0  # no signal: leave ordering to the other criteria
+        tl = _release_track_length_ms(r)
+        return abs(tl - file_length_ms) if tl is not None else float("inf")
 
     def key(r: dict) -> tuple:
         return (
             -_status_rank(r.get("status")),
             -_artist_rank(r, track_artist),
             -_type_rank(r.get("release_group")),
+            length_delta(r),
             -_country_rank(r.get("country")),
             r.get("date") or "9999",
             r.get("id") or "",
@@ -184,37 +232,71 @@ def earliest_official_year(releases: list[dict]) -> int | None:
         return None
 
 
-def _enrich_from_release(match) -> dict | None:
-    """Resolve the matched recording to a release and return album-level item data.
+def _mb_plugin():
+    from beets import metadata_plugins
 
-    Singleton (recording) matches carry no album/track/disc/year. We pick a release
-    the recording appears on (see ``select_release``), pull full album metadata via
-    beets' own ``album_for_id`` + ``merge_with_album``, and override the year with the
-    recording's earliest official release. Returns ``None`` on any failure so the
-    caller falls back to plain recording-level tagging. Runs on ``_beets_pool``.
+    return metadata_plugins.get_metadata_source("musicbrainz")
+
+
+def _get_recording_full(rec_id: str) -> dict | None:
+    """One authoritative recording lookup by id, with releases folded in.
+
+    Serves both purposes at import: complete recording metadata (relation credits
+    and all) *and* the releases enrichment needs -- no second request.
     """
-    rec_id = getattr(match.info, "track_id", None)
-    if not rec_id:
+    plugin = _mb_plugin()
+    if plugin is None:
         return None
-    try:
-        from beets import metadata_plugins
-        from beetsplug._utils.musicbrainz import RECORDING_INCLUDES
+    from beetsplug._utils.musicbrainz import RECORDING_INCLUDES
 
-        plugin = metadata_plugins.get_metadata_source("musicbrainz")
-        if plugin is None:
-            return None
-        rec = plugin.mb_api.get_recording(
+    try:
+        return plugin.mb_api.get_recording(
             rec_id,
             includes=RECORDING_INCLUDES
-            + ["releases", "release-groups", "artist-credits"],
+            + ["releases", "release-groups", "media", "artist-credits"],
         )
-        releases = rec.get("releases") or []
-        artists = getattr(match.info, "artists", None)
-        track_artist = artists[0] if artists else getattr(match.info, "artist", None)
-        chosen = select_release(releases, track_artist)
+    except Exception:
+        log.exception("recording lookup failed for %s", rec_id)
+        return None
+
+
+@lru_cache(maxsize=256)
+def _album_for_id_cached(release_id: str):
+    """Cache release lookups by id: a bulk album upload hits each release once.
+
+    ``merge_with_album`` reads the AlbumInfo and returns a fresh dict without
+    mutating it, so sharing the cached object across tracks is safe.
+    """
+    plugin = _mb_plugin()
+    if plugin is None:
+        return None
+    try:
+        return plugin.album_for_id(release_id)
+    except Exception:
+        log.exception("album_for_id failed for %s", release_id)
+        return None
+
+
+def _enrich_from_release(
+    releases: list[dict],
+    rec_id: str,
+    track_artist: str | None,
+    file_length_s: float | None,
+) -> dict | None:
+    """Resolve a recording's releases to one release and return album-level data.
+
+    Given the releases from the import lookup, pick one (see ``select_release``,
+    length-aware), pull full album metadata via beets' own ``album_for_id`` +
+    ``merge_with_album`` (cached), and override the year with the recording's
+    earliest official release. Returns ``None`` on any failure so the caller keeps
+    the plain recording-level tags. Runs on ``_beets_pool``.
+    """
+    try:
+        file_length_ms = int(file_length_s * 1000) if file_length_s else None
+        chosen = select_release(releases, track_artist, file_length_ms)
         if chosen is None:
             return None
-        album_info = plugin.album_for_id(chosen["id"])
+        album_info = _album_for_id_cached(chosen["id"])
         if album_info is None:
             return None
         album_track = next(
@@ -236,19 +318,32 @@ def _apply_and_stage_sync(
 ) -> tuple[Path, Path]:
     """Tag the file in place (in staging) and report where it should be filed.
 
-    Returns ``(staged, dest)``: ``staged`` is the tagged file, still in staging;
-    ``dest`` is the canonical pool path its tags map to. Nothing is written into
-    the pool here -- the caller moves ``staged`` onto ``dest`` (``promote_pool_file``)
-    only once dedup decides this copy wins, so an existing pool file is never at
-    risk before that decision, and a discarded upload leaves no pool litter.
+    The imported track's metadata comes from a single authoritative recording
+    lookup by id (not from the search-built candidate), with release enrichment
+    layered on top. Returns ``(staged, dest)``: ``staged`` is the tagged file,
+    still in staging; ``dest`` is the canonical pool path its tags map to. Nothing
+    is written into the pool here -- the caller moves ``staged`` onto ``dest``
+    (``promote_pool_file``) only once dedup decides this copy wins.
     """
-    match = candidate._match
-    item = match.item
-    enriched = _enrich_from_release(match) if enrich else None
-    if enriched is not None:
-        item.update(enriched)
-    else:
-        match.apply_metadata()  # recording-level only; no album/track/disc/year
+    item = Item.from_path(str(file_path))
+    rec = _get_recording_full(candidate.mb_track_id) if candidate.mb_track_id else None
+    if rec is not None:
+        plugin = _mb_plugin()
+        track_info = plugin.track_info(rec)
+        item.update(track_info.item_data)
+        track_artist = track_info.artist
+        releases = rec.get("releases") or []
+    else:  # lookup failed: fall back to the search-level candidate metadata
+        info = candidate._match.info
+        item.update(info.item_data)
+        track_artist = info.artist
+        releases = []
+    if enrich and releases:
+        enriched = _enrich_from_release(
+            releases, candidate.mb_track_id, track_artist, item.length
+        )
+        if enriched is not None:
+            item.update(enriched)
     item.write(path=str(file_path))
     item.add(_lib)  # gives the item the library dir/path-formats destination() needs
     dest = Path(os.fsdecode(item.destination()))

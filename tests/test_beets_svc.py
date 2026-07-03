@@ -8,6 +8,8 @@ from src.beets_svc import (
     _get_candidates_sync,
     _apply_and_stage_sync,
     _stage_as_is_sync,
+    _nearest_release_length,
+    _album_for_id_cached,
     select_release,
     earliest_official_year,
 )
@@ -109,9 +111,12 @@ def test_earliest_official_year_ignores_non_official():
     assert earliest_official_year(rels) == 1995
 
 
-def _mk_match(artist, title, length, isrc, mbid, distance):
+def _mk_match(artist, title, length, isrc, mbid, distance, disambig=None):
     return SimpleNamespace(
-        info=SimpleNamespace(artist=artist, title=title, length=length, isrc=isrc, track_id=mbid),
+        info=SimpleNamespace(
+            artist=artist, title=title, length=length, isrc=isrc,
+            track_id=mbid, trackdisambig=disambig,
+        ),
         distance=SimpleNamespace(distance=distance),
     )
 
@@ -144,21 +149,76 @@ def test_dedup_lowest_mbid_breaks_full_tie():
 
 
 def test_dedup_keeps_distinct_tracks_in_order():
+    # Different titles, or same title with a distinguishing disambiguation, stay
+    # separate; the two "Song One" takes are told apart by their disambig.
     matches = [
-        _mk_match("A", "Song One", 100.0, None, "1", 0.01),
+        _mk_match("A", "Song One", 100.0, None, "1", 0.01, disambig="studio"),
         _mk_match("A", "Song Two", 200.0, None, "2", 0.02),
-        _mk_match("A", "Song One", 240.0, None, "3", 0.03),  # same title, different length
+        _mk_match("A", "Song One", 240.0, None, "3", 0.03, disambig="live"),
     ]
     assert [m.info.track_id for m in _dedup_matches(matches)] == ["1", "2", "3"]
 
 
-def test_dedup_sub_second_length_groups_together():
-    # 177.0 and 177.9 both display as 2:57 (truncated), so they must collapse
+def test_dedup_collapses_same_title_artist_regardless_of_length():
+    # No disambiguation: same (artist, title) is one logical track even when the
+    # recording lengths differ -- lengths are corrected before scoring, so they no
+    # longer partition the group. Lower distance wins.
     matches = [
-        _mk_match("A", "T", 177.0, None, "a", 0.01),
-        _mk_match("A", "T", 177.9, None, "b", 0.01),
+        _mk_match("A", "T", 100.0, None, "1", 0.01),
+        _mk_match("A", "T", 240.0, None, "2", 0.02),
     ]
-    assert len(_dedup_matches(matches)) == 1
+    assert [m.info.track_id for m in _dedup_matches(matches)] == ["1"]
+
+
+def _rec_with_release_tracks(rec_len_ms, *release_track_lens_ms):
+    """A search-shaped recording dict with per-release track lengths."""
+    return {
+        "id": "rec",
+        "length": rec_len_ms,
+        "releases": [
+            {"id": f"r{i}", "media": [{"track": [{"length": tl}]}]}
+            for i, tl in enumerate(release_track_lens_ms)
+        ],
+    }
+
+
+def test_nearest_release_length_picks_track_closest_to_file():
+    # The real arrow case: recording length 221.0s, but the album track length is
+    # 222.706s; the file is 222.707s. The nearest per-release track length wins.
+    rec = _rec_with_release_tracks(221000, 223000, 222706)
+    assert _nearest_release_length(rec, 222.707) == pytest.approx(222.706)
+
+
+def test_nearest_release_length_none_without_track_lengths():
+    rec = {"id": "rec", "length": 221000, "releases": [{"id": "r", "media": []}]}
+    assert _nearest_release_length(rec, 222.7) is None
+
+
+def test_nearest_release_length_none_without_file_length():
+    rec = _rec_with_release_tracks(221000, 222706)
+    assert _nearest_release_length(rec, None) is None
+
+
+def test_select_release_length_breaks_edition_tie():
+    # Two editions tie on status/artist/type; the one whose track length matches
+    # the file (~222.7s) wins, ahead of country/date/id.
+    a = _rel("r-a", "Album", "Album", [], "Official", "2019", "XW")
+    b = _rel("r-b", "Album", "Album", [], "Official", "2019", "XW")
+    a["media"] = [{"track": [{"length": 200000}]}]
+    b["media"] = [{"track": [{"length": 222706}]}]
+    assert select_release([a, b], "half•alive", 222707)["id"] == "r-b"
+
+
+def test_album_for_id_cached_hits_mb_once():
+    _album_for_id_cached.cache_clear()
+    album = MagicMock()
+    plugin = MagicMock()
+    plugin.album_for_id.return_value = album
+    with patch("src.beets_svc._mb_plugin", return_value=plugin):
+        first = _album_for_id_cached("rel-1")
+        second = _album_for_id_cached("rel-1")
+    assert first is album and second is album
+    plugin.album_for_id.assert_called_once_with("rel-1")
 
 
 def _make_proposal(distance=0.05, rec=3):
@@ -202,31 +262,52 @@ def test_get_candidates_sync_maps_fields(tmp_path):
     assert result.recommendation == 3
 
 
-def test_apply_and_move_sync_writes_enriched_metadata(tmp_path):
+def _mk_apply_mocks(dest, *, rec=None, track_data=None, artist="half·alive"):
+    """Wire the mocks the new by-id import path needs.
+
+    Returns (item, plugin, rec) with `src.beets_svc.Item.from_path` and the MB
+    plugin's `track_info` prepared. `rec` defaults to a recording carrying one
+    release so enrichment is attempted.
+    """
+    item = MagicMock()
+    item.destination.return_value = str(dest)
+    item.length = 222.7
+    rec = rec if rec is not None else {"id": "rec-1", "length": 200000, "releases": [{"id": "r"}]}
+    ti = MagicMock()
+    ti.item_data = track_data if track_data is not None else {"title": "t", "artist": artist}
+    ti.artist = artist
+    plugin = MagicMock()
+    plugin.track_info.return_value = ti
+    return item, plugin, rec
+
+
+def test_apply_and_stage_sync_writes_recording_then_enriched(tmp_path):
     audio = tmp_path / "song.mp3"
     audio.write_bytes(b"audio data")
-
-    proposal, raw_match = _make_proposal()
     dest_path = tmp_path / ".pool" / "half·alive" / "Now, Not Yet" / "05 - still feel..mp3"
-    raw_match.item.destination.return_value = str(dest_path)
+    item, plugin, rec = _mk_apply_mocks(dest_path, track_data={"title": "still feel."})
 
     candidate = Candidate(
         index=0, artist="half·alive", title="still feel.", album="",
-        year=None, mb_track_id="rec-1", distance=0.05, _match=raw_match,
+        year=None, mb_track_id="rec-1", distance=0.05, _match=MagicMock(),
     )
     enriched = {"album": "Now, Not Yet", "track": 5, "disc": 1, "year": 2018}
 
     with (
-        patch("src.beets_svc._lib", MagicMock()),
+        patch("src.beets_svc.Item.from_path", return_value=item),
+        patch("src.beets_svc._get_recording_full", return_value=rec) as lookup,
+        patch("src.beets_svc._mb_plugin", return_value=plugin),
         patch("src.beets_svc._enrich_from_release", return_value=enriched),
+        patch("src.beets_svc._lib", MagicMock()),
     ):
         staged, dest = _apply_and_stage_sync(audio, candidate)
 
-    raw_match.item.update.assert_called_once_with(enriched)
-    raw_match.apply_metadata.assert_not_called()
-    raw_match.item.write.assert_called_once_with(path=str(audio))
-    raw_match.item.add.assert_called_once()
-    raw_match.item.move.assert_not_called()  # placement is deferred to the caller
+    lookup.assert_called_once_with("rec-1")  # exactly one recording lookup on import
+    item.update.assert_any_call({"title": "still feel."})  # authoritative recording tags
+    item.update.assert_any_call(enriched)  # enrichment layered on top
+    item.write.assert_called_once_with(path=str(audio))
+    item.add.assert_called_once()
+    item.move.assert_not_called()  # placement is deferred to the caller
     assert staged == audio  # tagged in place, still in staging
     assert dest == dest_path
 
@@ -244,17 +325,18 @@ def test_apply_and_stage_sync_never_touches_the_pool(tmp_path):
     audio.parent.mkdir()
     audio.write_bytes(b"NEW UPLOAD")
 
-    proposal, raw_match = _make_proposal()
-    raw_match.item.destination.return_value = str(canonical)
-
+    item, plugin, rec = _mk_apply_mocks(canonical)
     candidate = Candidate(
         index=0, artist="half·alive", title="still feel.", album="",
-        year=None, mb_track_id="rec-1", distance=0.05, _match=raw_match,
+        year=None, mb_track_id="rec-1", distance=0.05, _match=MagicMock(),
     )
 
     with (
-        patch("src.beets_svc._lib", MagicMock()),
+        patch("src.beets_svc.Item.from_path", return_value=item),
+        patch("src.beets_svc._get_recording_full", return_value=rec),
+        patch("src.beets_svc._mb_plugin", return_value=plugin),
         patch("src.beets_svc._enrich_from_release", return_value={"album": "Now, Not Yet"}),
+        patch("src.beets_svc._lib", MagicMock()),
     ):
         staged, dest = _apply_and_stage_sync(audio, candidate)
 
@@ -264,52 +346,80 @@ def test_apply_and_stage_sync_never_touches_the_pool(tmp_path):
     assert list(pool.iterdir()) == [canonical]  # no temp file created in the pool
 
 
-def test_apply_and_move_sync_falls_back_to_recording_level(tmp_path):
+def test_apply_and_stage_sync_recording_level_when_enrich_returns_none(tmp_path):
     audio = tmp_path / "song.mp3"
     audio.write_bytes(b"audio data")
-
-    proposal, raw_match = _make_proposal()
-    raw_match.item.destination.return_value = str(tmp_path / ".pool" / "unmatched.mp3")
+    dest = tmp_path / ".pool" / "unmatched.mp3"
+    item, plugin, rec = _mk_apply_mocks(dest, track_data={"title": "B", "artist": "A"})
 
     candidate = Candidate(
         index=0, artist="A", title="B", album="", year=None,
-        mb_track_id="rec-1", distance=0.05, _match=raw_match,
+        mb_track_id="rec-1", distance=0.05, _match=MagicMock(),
     )
 
     with (
-        patch("src.beets_svc._lib", MagicMock()),
+        patch("src.beets_svc.Item.from_path", return_value=item),
+        patch("src.beets_svc._get_recording_full", return_value=rec),
+        patch("src.beets_svc._mb_plugin", return_value=plugin),
         patch("src.beets_svc._enrich_from_release", return_value=None),
+        patch("src.beets_svc._lib", MagicMock()),
     ):
         _apply_and_stage_sync(audio, candidate)
 
-    raw_match.apply_metadata.assert_called_once()
-    raw_match.item.update.assert_not_called()
-    raw_match.item.write.assert_called_once_with(path=str(audio))
+    item.update.assert_called_once_with({"title": "B", "artist": "A"})  # recording only
+    item.write.assert_called_once_with(path=str(audio))
 
 
-def test_apply_and_move_sync_skips_enrichment_when_disabled(tmp_path):
+def test_apply_and_stage_sync_falls_back_when_lookup_fails(tmp_path):
+    # If the import lookup fails, apply the search-level candidate metadata.
     audio = tmp_path / "song.mp3"
     audio.write_bytes(b"audio data")
+    item = MagicMock()
+    item.destination.return_value = str(tmp_path / ".pool" / "x.mp3")
+    item.length = 222.7
 
-    proposal, raw_match = _make_proposal()
-    raw_match.item.destination.return_value = str(
-        tmp_path / ".pool" / "half·alive" / "05 - still feel..mp3"
-    )
-
+    match = MagicMock()
+    match.info.item_data = {"title": "B", "artist": "A"}
+    match.info.artist = "A"
     candidate = Candidate(
-        index=0, artist="half·alive", title="still feel.", album="",
-        year=None, mb_track_id="rec-1", distance=0.05, _match=raw_match,
+        index=0, artist="A", title="B", album="", year=None,
+        mb_track_id="rec-1", distance=0.05, _match=match,
     )
 
     with (
-        patch("src.beets_svc._lib", MagicMock()),
+        patch("src.beets_svc.Item.from_path", return_value=item),
+        patch("src.beets_svc._get_recording_full", return_value=None),
         patch("src.beets_svc._enrich_from_release") as enrich,
+        patch("src.beets_svc._lib", MagicMock()),
+    ):
+        _apply_and_stage_sync(audio, candidate)
+
+    item.update.assert_called_once_with({"title": "B", "artist": "A"})
+    enrich.assert_not_called()  # no releases to enrich from
+
+
+def test_apply_and_stage_sync_skips_enrichment_when_disabled(tmp_path):
+    audio = tmp_path / "song.mp3"
+    audio.write_bytes(b"audio data")
+    dest = tmp_path / ".pool" / "half·alive" / "05 - still feel..mp3"
+    item, plugin, rec = _mk_apply_mocks(dest, track_data={"title": "still feel."})
+
+    candidate = Candidate(
+        index=0, artist="half·alive", title="still feel.", album="",
+        year=None, mb_track_id="rec-1", distance=0.05, _match=MagicMock(),
+    )
+
+    with (
+        patch("src.beets_svc.Item.from_path", return_value=item),
+        patch("src.beets_svc._get_recording_full", return_value=rec),
+        patch("src.beets_svc._mb_plugin", return_value=plugin),
+        patch("src.beets_svc._enrich_from_release") as enrich,
+        patch("src.beets_svc._lib", MagicMock()),
     ):
         _apply_and_stage_sync(audio, candidate, enrich=False)
 
     enrich.assert_not_called()
-    raw_match.apply_metadata.assert_called_once()
-    raw_match.item.update.assert_not_called()
+    item.update.assert_called_once_with({"title": "still feel."})
 
 
 def test_stage_as_is_sync(tmp_path):

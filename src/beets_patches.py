@@ -30,6 +30,7 @@ def patch_mb_search() -> None:
     """Apply the recording-search reshaping patches (idempotent)."""
     _patch_search_query()
     _patch_recording_criteria()
+    _patch_item_candidates()
 
 
 def _patch_search_query() -> None:
@@ -93,3 +94,33 @@ def _patch_recording_criteria() -> None:
         return query, criteria
 
     MusicBrainzPlugin.get_search_query_with_filters = _with_release
+
+
+def _patch_item_candidates() -> None:
+    """Build singleton candidates from the one search, not N lookups.
+
+    The stock ``item_candidates`` searches for ids then fetches every recording
+    with a separate ``get_recording`` (the dominant per-upload cost at 1 req/s).
+    The search response already carries everything matching and the confirmation
+    list need -- title, artist, length, ISRC, disambiguation, and each release's
+    per-track length. We build the TrackInfos straight from those hits and, before
+    beets scores them, correct each length to the nearest per-release track length
+    so distance / confidence / recommendation are honest. The imported track's full
+    metadata is fetched by id later (see ``beets_svc._apply_and_stage_sync``).
+    """
+    from beetsplug.musicbrainz import MusicBrainzPlugin
+
+    def _item_candidates(self, item, artist, title):
+        from .beets_svc import _nearest_release_length
+
+        results = self._get_candidates("track", [item], artist, title, False)
+        for rec in results:
+            hit = dict(rec)
+            hit.setdefault("disambiguation", None)  # absent from search hits
+            info = self.track_info(hit)
+            corrected = _nearest_release_length(rec, item.length)
+            if corrected is not None:
+                info.length = corrected
+            yield info
+
+    MusicBrainzPlugin.item_candidates = _item_candidates

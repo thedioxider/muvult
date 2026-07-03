@@ -4,6 +4,7 @@ These exercise the real patched code paths (they import beetsplug), so they
 require the beets runtime to be importable.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -108,3 +109,35 @@ def test_no_release_when_album_tag_missing():
         "track", [item], "Self", "The End Of It All", False
     )
     assert "release" not in criteria
+
+
+def test_item_candidates_builds_from_search_without_lookups():
+    # The override must turn one search into candidates directly, with no
+    # per-candidate get_recording, and correct each length to the nearest
+    # per-release track length (the arrow fix).
+    from beetsplug.musicbrainz import MusicBrainzPlugin
+
+    plugin = MusicBrainzPlugin.__new__(MusicBrainzPlugin)
+    hit = {
+        "id": "rec-1",
+        "title": "arrow",
+        "length": 221000,  # recording length
+        "artist_credit": [{"name": "half·alive"}],
+        "isrcs": ["USRC11803910"],
+        "releases": [{"id": "r", "media": [{"track": [{"length": 222706}]}]}],
+    }
+    plugin._get_candidates = MagicMock(return_value=[hit])
+    plugin.track_info = lambda rec: SimpleNamespace(
+        track_id=rec["id"], length=rec["length"] / 1000.0
+    )
+    plugin.mb_api = MagicMock()  # must not be used for lookups
+
+    item = MagicMock()
+    item.length = 222.707  # file duration, matches the album track length
+
+    result = list(plugin.item_candidates(item, "half·alive", "arrow"))
+
+    plugin._get_candidates.assert_called_once()
+    plugin.mb_api.get_recording.assert_not_called()
+    assert len(result) == 1
+    assert result[0].length == pytest.approx(222.706)  # corrected off recording length

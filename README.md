@@ -39,36 +39,53 @@ carrying extra tokens like `(Album Version)`. muvult patches the search into a
 more robust shape (`+artist:(…) +(recording:(…) alias:(…)) release:(…)`) --
 required identity fields, forgiving on description, album as an optional boost.
 
+### One search, no per-candidate lookups
+
+Candidates come from a **single** MusicBrainz recording search. That one response
+already carries everything matching and the picker need -- title, artist, ISRC,
+disambiguation, and every release the recording sits on with its per-release track
+length -- so muvult builds the candidates straight from it, skipping the extra
+per-candidate lookup beets would otherwise make (the dominant cost at 1 request/s).
+The full, authoritative metadata for the track you actually import is fetched once,
+by id, at import time.
+
+A recording's own stored length can differ from the length of the *track* on the
+release your file came from. Before scoring, muvult corrects each candidate's
+length to the nearest per-release track length, so the match distance, the shown
+confidence, and the auto-import recommendation all reflect the real duration --
+and a duplicate recording can't win just because its bare length happens to match.
+
 ### Candidate deduplication
 
 MusicBrainz frequently holds several recording entities for one performance --
-typically one per release of the same album -- differing only in trivia: a
-sub-second length delta, an ISRC, or which release they hang off. Presented
-raw, the candidate list shows the same song several times, indistinguishable to
-the user. muvult collapses these: candidates sharing artist, title, and
-displayed duration (whole seconds) are grouped, and one representative is kept.
-The survivor is chosen by, in order, best beets match (lowest distance), then
-carrying an ISRC (the canonically-registered, usually worldwide recording), then
-lowest recording id so the choice is deterministic across uploads. This applies
-to every match, including strong ones, so even auto-imports pick the canonical
-recording.
+typically one per release of the same album -- differing only in trivia: a length
+delta, an ISRC, or which release they hang off. Presented raw, the candidate list
+shows the same song several times, indistinguishable to the user. muvult collapses
+these: candidates sharing artist, title, and disambiguation are grouped, and one
+representative is kept. The survivor is chosen by, in order, best beets match
+(lowest corrected distance), then carrying an ISRC (the canonically-registered,
+usually worldwide recording), then lowest recording id so the choice is
+deterministic across uploads. This applies to every match, including strong ones,
+so even auto-imports pick the canonical recording.
 
 ### Release enrichment
 
 A MusicBrainz recording carries only track-level metadata (title, artist) -- it
 is not tied to any release, so it has no album, track number, disc, or year. When
-enabled, once a candidate is chosen muvult resolves it to a specific release and
-pulls full album metadata from there. The release is picked, in order, by:
-official status; a primary artist matching the track's (over "Various Artists"
+enabled, muvult resolves the imported recording to a specific release and pulls
+full album metadata from there. The release is picked, in order, by: official
+status; a primary artist matching the track's (over "Various Artists"
 compilations); a studio album (no secondary types, with album over EP over
-single); a worldwide release; earliest date; then lowest release id. The year
-comes from the recording's earliest official release. If any of this fails the
-track still imports, with recording-level tags only.
+single); the release whose track length is closest to the file; a worldwide
+release; earliest date; then lowest release id. The year comes from the
+recording's earliest official release. If any of this fails the track still
+imports, with recording-level tags only.
 
-This costs an extra MusicBrainz lookup per track (rate-limited to 1/s), so it is
-**off by default** and opt-in per user via `/settings` -- with it off, tracks are
-tagged with title and artist only (any album/track tags already on the file are
-kept) and import faster.
+Enrichment reuses the releases from the import lookup (no extra request) and
+caches release lookups by id, so a whole album uploaded at once resolves its
+shared release just once. It is **off by default** and opt-in per user via
+`/settings` -- with it off, tracks are tagged with title and artist only (any
+album/track tags already on the file are kept) and import faster.
 
 ### Confirmation modes
 
