@@ -44,14 +44,6 @@ async def test_create_library_existing(client):
 
 
 @pytest.mark.asyncio
-async def test_delete_library(client):
-    with respx.mock:
-        _mock_auth()
-        respx.delete(f"{BASE}/api/library/7").mock(return_value=httpx.Response(200))
-        await client.delete_library(7)
-
-
-@pytest.mark.asyncio
 async def test_get_user(client):
     with respx.mock:
         _mock_auth()

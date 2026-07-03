@@ -49,9 +49,6 @@ class NavidromeClient:
         r = await self._request("POST", "/api/library", json={"name": f"{username}'s library", "path": path})
         return r.json()["id"]
 
-    async def delete_library(self, library_id: int) -> None:
-        await self._request("DELETE", f"/api/library/{library_id}")
-
     async def update_library(self, library_id: int, username: str) -> None:
         await self._request("PUT", f"/api/library/{library_id}", json={"name": f"{username}'s library", "path": f"{self._music_path}/{username}"})
 

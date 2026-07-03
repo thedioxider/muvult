@@ -15,8 +15,6 @@ from ..navidrome import NavidromeClient
 from ..pool import create_symlink, remove_pool_file, remove_symlink
 from ..tg_utils import safe_answer
 
-_ND_SEP = "\x1f"
-
 
 class _AdminOnly(Filter):
     async def __call__(self, _ev: Any, is_admin: bool = False, **_kw: Any) -> bool:
@@ -42,13 +40,6 @@ def _nd() -> NavidromeClient:
             music_path=settings.nd_music_path,
         )
     return _nd_client
-
-
-def _nd_err_keyboard(action: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="Yes, proceed anyway", callback_data=f"nd_skip{_ND_SEP}{action}"),
-        InlineKeyboardButton(text="No", callback_data=f"nd_skip{_ND_SEP}cancel"),
-    ]])
 
 
 async def _local_remove(tg_id: int) -> str | None:
@@ -156,18 +147,9 @@ async def cmd_removeuser(message: Message) -> None:
         await message.answer(f"No user: {username}")
         return
 
-    tg_id = user.tg_id
-    try:
-        await _nd().delete_library(user.navidrome_library_id)
-    except httpx.HTTPError as e:
-        await message.answer(
-            f"Navidrome unreachable: {e}\n"
-            f"Remove {username} from DB anyway? (library will remain in Navidrome)",
-            reply_markup=_nd_err_keyboard(f"rm{_ND_SEP}{tg_id}"),
-        )
-        return
-
-    await _local_remove(tg_id)
+    # The Navidrome library is left in place (never deleted); only the local
+    # pool/symlinks/DB are cleaned up.
+    await _local_remove(user.tg_id)
     await message.answer(f"Removed user {username}")
 
 
@@ -207,48 +189,37 @@ async def cmd_setusername(message: Message) -> None:
     old, new = parts[1], parts[2]
 
     async with get_session() as session:
-        result = await session.exec(select(User).where(User.username == old))
-        user = result.first()
+        user = (await session.exec(select(User).where(User.username == old))).first()
+        taken = (await session.exec(select(User).where(User.username == new))).first()
     if not user:
         await message.answer(f"No user: {old}")
         return
+    if taken:
+        await message.answer(f"Username already taken: {new}")
+        return
 
+    from ..config import settings
+    if Path(settings.music_root, new).exists():
+        await message.answer(f"A directory already exists for {new}; not renaming.")
+        return
+
+    try:
+        await _local_rename(old, new)
+    except OSError as e:
+        await message.answer(f"Rename failed: {e}")
+        return
+
+    # Navidrome is updated last, only after the local rename succeeded.
     try:
         await _nd().update_library(user.navidrome_library_id, new)
     except httpx.HTTPError as e:
         await message.answer(
-            f"Navidrome unreachable: {e}\n"
-            f"Rename {old} → {new} in DB anyway? (Navidrome library will keep old name)",
-            reply_markup=_nd_err_keyboard(f"mv{_ND_SEP}{old}{_ND_SEP}{new}"),
+            f"Renamed {old} → {new}, but Navidrome was unreachable ({e}); "
+            f"its library path is now stale — fix it in Navidrome once it's back."
         )
         return
 
-    await _local_rename(old, new)
     await message.answer(f"Renamed {old} → {new}")
-
-
-@admin_router.callback_query(lambda c: c.data and c.data.startswith(f"nd_skip{_ND_SEP}"))
-async def cb_nd_skip(callback: CallbackQuery) -> None:
-    parts = callback.data.split(_ND_SEP)
-    action = parts[1]
-
-    if action == "cancel":
-        await callback.message.edit_text("Cancelled.")
-        await safe_answer(callback)
-        return
-
-    if action == "rm":
-        tg_id = int(parts[2])
-        username = await _local_remove(tg_id)
-        text = f"Removed user {username} (Navidrome library not deleted)." if username else "User not found."
-        await callback.message.edit_text(text)
-
-    elif action == "mv":
-        old, new = parts[2], parts[3]
-        await _local_rename(old, new)
-        await callback.message.edit_text(f"Renamed {old} → {new} (Navidrome library not updated).")
-
-    await safe_answer(callback)
 
 
 @admin_router.message(Command("recreatelinks"))
