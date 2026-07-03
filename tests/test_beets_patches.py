@@ -111,6 +111,49 @@ def test_no_release_when_album_tag_missing():
     assert "release" not in criteria
 
 
+def test_track_info_from_thin_search_hit():
+    # A search hit is thinner than a lookup payload: no disambiguation, maybe no
+    # length, and its artist_credit elements carry no joinphrase. Candidate building
+    # must not depend on those (the arrow regression: reusing track_info raised
+    # KeyError on live data and yielded zero candidates).
+    from src.beets_patches import _track_info_from_hit
+
+    hit = {  # shaped like a real recording-search result
+        "id": "86349be4-552a-4b0f-ac7b-129bfda0fbd3",
+        "title": "arrow",
+        "isrcs": ["USRC11803910"],
+        "artist_credit": [
+            {"name": "half•alive", "artist": {"id": "00d0", "name": "half•alive"}}
+        ],
+    }  # note: no "joinphrase", no "disambiguation", no "length"
+
+    info = _track_info_from_hit(hit)
+
+    assert info.track_id == "86349be4-552a-4b0f-ac7b-129bfda0fbd3"
+    assert info.isrc == "USRC11803910"
+    assert info.artist == "half•alive"
+    assert info.artist_id == "00d0"
+    assert info.length is None
+    assert info.trackdisambig is None
+
+
+def test_track_info_from_hit_joins_multiple_credits():
+    from src.beets_patches import _track_info_from_hit
+
+    hit = {
+        "id": "r1",
+        "title": "duet",
+        "length": 200000,
+        "artist_credit": [
+            {"name": "A", "joinphrase": " & ", "artist": {"id": "a"}},
+            {"name": "B", "artist": {"id": "b"}},
+        ],
+    }
+    info = _track_info_from_hit(hit)
+    assert info.artist == "A & B"
+    assert info.length == pytest.approx(200.0)
+
+
 def test_item_candidates_builds_from_search_without_lookups():
     # The override must turn one search into candidates directly, with no
     # per-candidate get_recording, and correct each length to the nearest

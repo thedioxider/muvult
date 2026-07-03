@@ -101,12 +101,18 @@ def _patch_item_candidates() -> None:
 
     The stock ``item_candidates`` searches for ids then fetches every recording
     with a separate ``get_recording`` (the dominant per-upload cost at 1 req/s).
-    The search response already carries everything matching and the confirmation
-    list need -- title, artist, length, ISRC, disambiguation, and each release's
-    per-track length. We build the TrackInfos straight from those hits and, before
-    beets scores them, correct each length to the nearest per-release track length
-    so distance / confidence / recommendation are honest. The imported track's full
-    metadata is fetched by id later (see ``beets_svc._apply_and_stage_sync``).
+    The search response already carries everything matching, dedup, and the
+    confirmation list need -- title, artist, length, ISRC, disambiguation, and each
+    release's per-track length -- so we build a lightweight TrackInfo straight from
+    each hit and, before beets scores it, correct the length to the nearest
+    per-release track length so distance / confidence / recommendation are honest.
+
+    We deliberately do *not* reuse the plugin's ``track_info``: it is written for a
+    recording *lookup* payload and hard-indexes keys a search hit omits
+    (``joinphrase``, ``length``, ``disambiguation``, ...), so it raises on search
+    data and would need re-patching whenever beets touches another field. The
+    imported track's full, authoritative metadata is fetched by id later, through
+    the real ``track_info`` on a real lookup (see ``beets_svc._apply_and_stage_sync``).
     """
     from beetsplug.musicbrainz import MusicBrainzPlugin
 
@@ -115,12 +121,36 @@ def _patch_item_candidates() -> None:
 
         results = self._get_candidates("track", [item], artist, title, False)
         for rec in results:
-            hit = dict(rec)
-            hit.setdefault("disambiguation", None)  # absent from search hits
-            info = self.track_info(hit)
+            info = _track_info_from_hit(rec)
             corrected = _nearest_release_length(rec, item.length)
             if corrected is not None:
                 info.length = corrected
             yield info
 
     MusicBrainzPlugin.item_candidates = _item_candidates
+
+
+def _track_info_from_hit(rec: dict):
+    """A minimal TrackInfo from a recording-search hit, for matching only.
+
+    Reads just the fields scoring, dedup, and the picker use, every one via
+    ``.get`` so a thinner-than-expected hit degrades instead of raising. Full
+    metadata is not derived here -- it comes from the by-id import lookup.
+    """
+    from beets.autotag import TrackInfo
+
+    credits = rec.get("artist_credit") or []
+    artist = "".join((c.get("name") or "") + c.get("joinphrase", "") for c in credits)
+    first_artist = credits[0].get("artist") if credits else None
+    isrcs = rec.get("isrcs")
+    length = rec.get("length")
+    return TrackInfo(
+        track_id=rec.get("id"),
+        title=rec.get("title"),
+        artist=artist or None,
+        artist_id=(first_artist or {}).get("id"),
+        length=length / 1000.0 if length else None,
+        isrc=";".join(isrcs) if isrcs else None,
+        trackdisambig=rec.get("disambiguation") or None,
+        data_source="MusicBrainz",
+    )
