@@ -135,6 +135,9 @@ Configuration is read from the environment (see `.env.example`):
 | `MUSIC_ROOT`    | Library root inside the container (default `/music`)         |
 | `STAGING_ROOT`  | Temp download area inside the container (default `/staging`) |
 | `MB_SEARCH_LIMIT` | MusicBrainz search results fetched per lookup (default 8)  |
+| `TG_API_ID` / `TG_API_HASH` | Telegram app credentials (https://my.telegram.org) for the self-hosted Bot API server |
+| `BOT_API_URL`   | Self-hosted Bot API server URL. Empty -> cloud API (20 MB cap) |
+| `BOT_API_LOCAL` | `1` if that server runs with `--local` (files read off the shared volume) |
 
 ## Deployment
 
@@ -151,6 +154,14 @@ Volumes:
 - `/data/media/muvult:/music` -- pool + per-user libraries (persistent)
 - `/data/var/muvult:/data` -- SQLite databases (persistent)
 - `/tmp/muvult:/staging` -- scratch download area (ephemeral)
+- `bot-api-data:/var/lib/telegram-bot-api` -- shared with the `telegram-bot-api`
+  service so muvult reads locally-served files off disk
+
+**Large files.** The cloud Bot API caps bot downloads at 20 MB, so lossless
+tracks fail. The compose stack bundles a self-hosted `telegram-bot-api` server
+(local mode, 2000 MB cap); muvult points at it via `BOT_API_URL`. Fill
+`TG_API_ID` / `TG_API_HASH` in `.env` before deploying. To fall back to the
+cloud API, leave `BOT_API_URL` empty and drop the extra service.
 
 Navidrome runs on the host; the container reaches it via
 `host.docker.internal` (mapped through `extra_hosts`). Because `/staging` and

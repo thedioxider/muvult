@@ -28,6 +28,12 @@ class Settings(BaseSettings):
     staging_root: str = "/staging"
     mb_search_limit: int = 8
 
+    # Self-hosted Telegram Bot API server. Code default is the cloud API (20 MB
+    # download cap): url unset, local off. Set BOT_API_URL to a local server to
+    # lift the cap to 2000 MB, and BOT_API_LOCAL=1 if it runs with --local.
+    bot_api_url: str | None = None
+    bot_api_local: bool = False
+
     @field_validator("admin_tg_ids", mode="before")
     @classmethod
     def parse_ids(cls, v: Any) -> list[int]:

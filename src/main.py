@@ -2,6 +2,8 @@ import asyncio
 import logging
 
 from aiogram import Bot, Dispatcher
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.telegram import TelegramAPIServer
 from aiogram.fsm.storage.memory import MemoryStorage
 
 from .auth import AuthMiddleware
@@ -19,7 +21,12 @@ async def main() -> None:
     await init_db()
     setup_beets(settings.music_root, settings.mb_search_limit)
 
-    bot = Bot(token=settings.bot_token)
+    session = None
+    if settings.bot_api_url:
+        session = AiohttpSession(
+            api=TelegramAPIServer.from_base(settings.bot_api_url, is_local=settings.bot_api_local)
+        )
+    bot = Bot(token=settings.bot_token, session=session)
     dp = Dispatcher(storage=MemoryStorage())
 
     dp.update.middleware(AuthMiddleware())
