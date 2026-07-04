@@ -31,6 +31,10 @@ _group_pending: dict[str, list[tuple[str, str, int]]] = {}
 _group_meta: dict[str, tuple] = {}
 _group_tasks: dict[str, asyncio.Task] = {}
 
+# Guards the pool-write + DB-commit critical section in _process_file so
+# concurrent uploads of the same track can't collide on the unique pool_path.
+_pool_commit_lock = asyncio.Lock()
+
 _STATUS_ICONS = {
     FileStatus.DOWNLOADING: "📥",
     FileStatus.TAGGING: "🔍",
@@ -251,7 +255,12 @@ async def _process_file(
 
         note = ""
         pool_root = Path(settings.music_root) / ".pool"
-        async with get_session() as session:
+        # Serialize the dedup->promote->insert->ownership->commit critical
+        # section: files are processed concurrently, so two uploads resolving to
+        # the same canonical path could both find no existing Track, both write
+        # onto dest, and collide on the unique pool_path. beets tagging is already
+        # serialized; this short section is the only remaining shared-state race.
+        async with _pool_commit_lock, get_session() as session:
             existing = await _find_existing_track(session, mb_id, pool_rel(dest))
 
             if existing:
