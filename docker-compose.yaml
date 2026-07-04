@@ -9,7 +9,7 @@ services:
     volumes:
       - /data/media/muvult:/music
       - /data/var/muvult:/data
-      - /tmp/muvult:/staging
+      - staging:/staging
       # Shared with telegram-bot-api at the identical path so local-mode file
       # paths returned by get_file resolve inside this container.
       - bot-api-data:/var/lib/telegram-bot-api
@@ -27,5 +27,23 @@ services:
     volumes:
       - bot-api-data:/var/lib/telegram-bot-api
 
+  # Scratch reaper: the local Bot API server keeps its downloaded originals and
+  # never prunes them, and staging can orphan files on a crashed import. Delete
+  # anything older than a week from both scratch volumes, hourly. Only files
+  # (-type f) so the server's per-token dir structure is left intact.
+  cleaner:
+    image: alpine:latest
+    container_name: muvult-cleaner
+    restart: unless-stopped
+    volumes:
+      - staging:/staging
+      - bot-api-data:/var/lib/telegram-bot-api
+    command: >
+      sh -c 'while true; do
+        find /staging /var/lib/telegram-bot-api -type f -mmin +10080 -delete;
+        sleep 3600;
+      done'
+
 volumes:
+  staging:
   bot-api-data:

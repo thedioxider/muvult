@@ -153,9 +153,13 @@ Volumes:
 
 - `/data/media/muvult:/music` -- pool + per-user libraries (persistent)
 - `/data/var/muvult:/data` -- SQLite databases (persistent)
-- `/tmp/muvult:/staging` -- scratch download area (ephemeral)
+- `staging:/staging` -- scratch download area (ephemeral named volume)
 - `bot-api-data:/var/lib/telegram-bot-api` -- shared with the `telegram-bot-api`
   service so muvult reads locally-served files off disk
+
+A `cleaner` sidecar deletes files older than a week from the `staging` and
+`bot-api-data` volumes hourly -- the local Bot API server keeps its downloaded
+originals and never prunes them on its own.
 
 **Large files.** The cloud Bot API caps bot downloads at 20 MB, so lossless
 tracks fail. The compose stack bundles a self-hosted `telegram-bot-api` server
