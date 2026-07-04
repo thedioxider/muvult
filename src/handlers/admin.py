@@ -12,7 +12,7 @@ from sqlmodel import select
 
 from ..db import Track, TrackOwnership, User, get_session
 from ..navidrome import NavidromeClient
-from ..pool import create_symlink, remove_pool_file, remove_symlink
+from ..pool import create_symlink, remove_pool_file, remove_symlink, user_library_root
 from ..tg_utils import safe_answer
 
 
@@ -283,9 +283,12 @@ def _parse_wildcard_prefix(path: str) -> str | None:
 
 
 async def _remove_track(session: Any, pool_root: Path, track: Track) -> None:
+    from ..config import settings
+    music_root = Path(settings.music_root)
     own_result = await session.exec(select(TrackOwnership).where(TrackOwnership.track_id == track.id))
     for o in own_result.all():
-        remove_symlink(Path(o.symlink_path))
+        link = Path(o.symlink_path)
+        remove_symlink(link, user_library_root(link, music_root))
     remove_pool_file(pool_root / track.pool_path)
     await session.delete(track)
 
@@ -299,7 +302,9 @@ async def _drop_ownership(session: Any, track: Track, user_id: int) -> bool | No
     )).first()
     if not own:
         return None
-    remove_symlink(Path(own.symlink_path))
+    from ..config import settings
+    link = Path(own.symlink_path)
+    remove_symlink(link, user_library_root(link, Path(settings.music_root)))
     await session.delete(own)
     await session.flush()
     return not (await session.exec(

@@ -32,10 +32,18 @@ def _cleanup_empty_parents(path: Path, stop_at: Path | None = None) -> None:
         parent = parent.parent
 
 
-def remove_symlink(symlink_path: Path) -> None:
+def user_library_root(symlink_path: Path, music_root: Path) -> Path:
+    """The user's library dir: the first path component under ``music_root``."""
+    return music_root / symlink_path.relative_to(music_root).parts[0]
+
+
+def remove_symlink(symlink_path: Path, library_root: Path | None = None) -> None:
     if symlink_path.is_symlink():
         symlink_path.unlink()
-        _cleanup_empty_parents(symlink_path)
+        # Prune now-empty album/artist dirs, but keep the user's library dir
+        # itself (removing it on the last track would orphan the Navidrome
+        # library). ``library_root`` is that boundary; None keeps old behavior.
+        _cleanup_empty_parents(symlink_path, library_root)
 
 
 def promote_pool_file(staged: Path, dest: Path) -> Path:
@@ -63,7 +71,7 @@ def update_symlinks(old_pool: Path, new_pool: Path, symlink_paths: list[Path]) -
     new_links = []
     for link in symlink_paths:
         user_dir = _find_user_dir(link, old_pool)
-        remove_symlink(link)
+        remove_symlink(link, user_dir)
         new_link = create_symlink(new_pool, user_dir)
         new_links.append(new_link)
     return new_links

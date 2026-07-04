@@ -6,6 +6,7 @@ from src.pool import (
     remove_symlink,
     remove_pool_file,
     update_symlinks,
+    user_library_root,
 )
 
 
@@ -39,6 +40,25 @@ def test_remove_symlink(dirs):
     remove_symlink(link)
 
     assert not link.exists()
+
+
+def test_remove_symlink_preserves_user_dir(dirs):
+    pool_dir, user_dir, root = dirs
+    pool_file = pool_dir / "01 - Song.mp3"
+    pool_file.write_bytes(b"audio")
+    link = create_symlink(pool_file, user_dir)  # user_dir/Artist/Album/...
+
+    remove_symlink(link, library_root=user_dir)
+
+    assert not link.exists()
+    assert user_dir.is_dir()  # empty user dir must survive
+    assert not (user_dir / "Artist").exists()  # empty intermediates cleaned up
+
+
+def test_user_library_root(dirs):
+    pool_dir, user_dir, root = dirs
+    link = user_dir / "Artist" / "Album" / "01 - Song.mp3"
+    assert user_library_root(link, root) == user_dir
 
 
 def test_remove_pool_file(dirs):
