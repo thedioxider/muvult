@@ -256,7 +256,7 @@ async def cmd_recreatelinks(message: Message) -> None:
                     missing.append(track.pool_path)
                     continue
                 remove_symlink(Path(ownership.symlink_path))
-                new_link = create_symlink(pool_file, user_dir)
+                new_link = create_symlink(pool_file, user_dir, flat=track.is_asis)
                 ownership.symlink_path = str(new_link)
                 count += 1
 

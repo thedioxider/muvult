@@ -25,6 +25,8 @@ class Track(SQLModel, table=True):
     musicbrainz_id: str | None = None
     format: str
     bitrate: int
+    # True for as-is (unmatched) imports, whose library symlinks are flat.
+    is_asis: bool = Field(default=False)
 
 
 class TrackOwnership(SQLModel, table=True):

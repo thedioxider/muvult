@@ -1,7 +1,10 @@
 import pytest
 from contextlib import asynccontextmanager
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
-from src.handlers.admin import cmd_adduser, cmd_users, cmd_settgid
+from sqlmodel import select
+from src.handlers.admin import cmd_adduser, cmd_users, cmd_settgid, cmd_recreatelinks
+from src.db import init_db, get_session, Track, TrackOwnership, User
 
 
 def _msg(text: str, tg_id: int = 1):
@@ -75,3 +78,36 @@ async def test_users_empty():
         await cmd_users(msg)
 
     assert "No users" in msg.answer.call_args[0][0]
+
+
+@pytest.mark.asyncio
+async def test_recreatelinks_relinks_asis_flat(tmp_path):
+    # Regression: /recreatelinks must relink as-is imports flat, not nested under
+    # their `users/<name>/<file>` pool-relative path.
+    await init_db(str(tmp_path / "db"))
+    music_root = tmp_path / "music"
+    pool_file = music_root / ".pool" / "users" / "alice" / "song.mp3"
+    pool_file.parent.mkdir(parents=True)
+    pool_file.write_bytes(b"audio")
+    user_dir = music_root / "alice"
+    user_dir.mkdir()
+    flat_link = user_dir / "song.mp3"  # where the flat link should live
+
+    async with get_session() as s:
+        s.add(User(id=1, tg_id=1, username="alice", navidrome_user_id="x", navidrome_library_id=1))
+        s.add(Track(id=1, pool_path="users/alice/song.mp3", format="mp3", bitrate=320, is_asis=True))
+        await s.commit()
+        s.add(TrackOwnership(track_id=1, user_id=1, symlink_path=str(flat_link)))
+        await s.commit()
+
+    msg = _msg("/recreatelinks alice")
+    with patch("src.config.settings", MagicMock(music_root=str(music_root))):
+        await cmd_recreatelinks(msg)
+
+    assert flat_link.is_symlink()
+    assert flat_link.resolve() == pool_file.resolve()
+    assert not (user_dir / "users").exists()  # never nested
+
+    async with get_session() as s:
+        own = (await s.exec(select(TrackOwnership))).first()
+        assert Path(own.symlink_path) == flat_link

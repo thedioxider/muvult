@@ -292,7 +292,7 @@ async def _process_file(
                 pool_file = promote_pool_file(staged, dest)
                 track = Track(
                     pool_path=pool_rel(pool_file), musicbrainz_id=mb_id,
-                    format=new_format, bitrate=new_bitrate,
+                    format=new_format, bitrate=new_bitrate, is_asis=is_asis,
                 )
                 session.add(track)
                 await session.flush()
