@@ -16,10 +16,11 @@ class NavidromeClient:
 
     async def _auth_header(self) -> dict[str, str]:
         if self._token is None or time.monotonic() - self._token_ts > _TOKEN_TTL:
-            r = await httpx.AsyncClient().post(
-                f"{self._base}/auth/login",
-                json={"username": self._user, "password": self._password},
-            )
+            async with httpx.AsyncClient() as c:
+                r = await c.post(
+                    f"{self._base}/auth/login",
+                    json={"username": self._user, "password": self._password},
+                )
             r.raise_for_status()
             self._token = r.json()["token"]
             self._token_ts = time.monotonic()
