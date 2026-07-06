@@ -2,9 +2,41 @@ import asyncio
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 from src.handlers import upload
-from src.handlers.upload import _format_status_message, FileState, _find_existing_track
-from src.models import FileStatus
+from src.handlers.upload import _format_status_message, FileState, _find_existing_track, _top_twins
+from src.models import Candidate, FileStatus
 from src.db import init_db, get_session, Track
+
+
+def _c(index, artist, title, disambig=None):
+    return Candidate(
+        index=index, artist=artist, title=title, album="", year=None,
+        mb_track_id=f"id{index}", distance=0.0, _match=None, disambig=disambig,
+    )
+
+
+def test_top_twins_unique_top_returns_single():
+    # #0 has no same-title/artist sibling -> unambiguous, only #0 comes back.
+    cands = [_c(0, "SOAD", "Aerials"), _c(1, "SOAD", "Chop Suey!"), _c(2, "Tool", "Ænema")]
+    assert [c.index for c in _top_twins(cands)] == [0]
+
+
+def test_top_twins_groups_same_artist_title_preserving_index():
+    cands = [
+        _c(0, "System of a Down", "Aerials"),                 # studio
+        _c(1, "System of a Down", "Aerials", "live"),         # twin
+        _c(2, "System of a Down", "Toxicity"),                # different title
+        _c(3, "System of a Down", "Aerials", "radio edit"),   # twin
+    ]
+    assert [c.index for c in _top_twins(cands)] == [0, 1, 3]
+
+
+def test_top_twins_is_case_insensitive():
+    cands = [_c(0, "SOAD", "Aerials"), _c(1, "soad", "aerials", "live")]
+    assert [c.index for c in _top_twins(cands)] == [0, 1]
+
+
+def test_top_twins_empty():
+    assert _top_twins([]) == []
 
 
 def test_format_status_groups_by_status():

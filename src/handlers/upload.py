@@ -78,6 +78,22 @@ async def _find_existing_track(session, mb_id: str | None, pool_path: str):
     return result.first()
 
 
+def _top_twins(candidates: list) -> list:
+    """Candidate #0 together with any same-(artist, title) 'twins'.
+
+    After dedup, two candidates sharing artist and title differ only by
+    disambiguation -- distinct MB recordings of the "same" track (a live take, a
+    radio edit, ...). This returns #0 and every such twin, in list order, so a
+    single-element result means the top match is unambiguous. Each Candidate keeps
+    its original ``.index`` (its position in the full list), which the confirmation
+    callbacks resolve against.
+    """
+    if not candidates:
+        return []
+    key = (candidates[0].artist.lower(), candidates[0].title.lower())
+    return [c for c in candidates if (c.artist.lower(), c.title.lower()) == key]
+
+
 @dataclass
 class FileState:
     original_name: str
@@ -227,7 +243,21 @@ async def _process_file(
         if mode == ConfirmationMode.OFF:
             chosen_index = 0 if (is_high and tag_result.candidates) else "asis"
         elif mode == ConfirmationMode.AUTO and is_high and tag_result.candidates:
-            chosen_index = 0
+            twins = _top_twins(tag_result.candidates)
+            if len(twins) == 1:
+                chosen_index = 0  # unique high-confidence match: import without asking
+            else:
+                # High confidence, but candidate #0 has same-artist+title twins that
+                # dedup kept apart by disambiguation (a live take, a radio edit, ...).
+                # We can't tell which the user meant, so prompt -- but only among the
+                # twins, not the whole list. The buttons carry each candidate's
+                # original .index (its position in the full list), so the int result
+                # still resolves against tag_result.candidates below.
+                chosen_index = await _queue_confirmation(
+                    bot, tg_id, file_id, filename,
+                    TagResult(candidates=twins, recommendation=0),
+                    file_path, states, status_chat_id, status_msg_id,
+                )
         else:
             while True:
                 chosen_index = await _queue_confirmation(bot, tg_id, file_id, filename, tag_result, file_path, states, status_chat_id, status_msg_id)
