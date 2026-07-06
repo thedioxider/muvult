@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 from asyncio import get_running_loop
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
@@ -32,7 +33,7 @@ _PATH_FORMAT = "$albumartist/$album/$title%if{$trackdisambig, ($trackdisambig)}"
 _beets_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="beets")
 
 
-def setup_beets(music_root: str, search_limit: int = 8) -> None:
+def setup_beets(music_root: str, search_limit: int = 48) -> None:
     global _lib
     pool_path = str(Path(music_root) / ".pool")
     beets_config.read(user=False, defaults=True)
@@ -50,6 +51,21 @@ def setup_beets(music_root: str, search_limit: int = 8) -> None:
 async def get_candidates(file_path: Path) -> TagResult:
     loop = get_running_loop()
     return await loop.run_in_executor(_beets_pool, _get_candidates_sync, file_path)
+
+
+def normalize_title(title: str, loose: bool = False) -> str:
+    """Fold a title for identity comparisons.
+
+    Strict (default) just lowercases -- used for deduplication, where a
+    false-positive match would silently make a legitimate distinct candidate
+    unreachable. Loose also strips all punctuation, so titles MusicBrainz
+    submissions disagree on (``ATWA`` / ``A.T.W.A`` / ``Atwa``) compare
+    equal -- used where a false-positive match is safe, e.g. offering a human
+    a confirmation choice.
+    """
+    if not loose:
+        return title.lower()
+    return re.sub(r"[^\w]+", "", title, flags=re.UNICODE).lower()
 
 
 def _dedup_matches(matches: list) -> list:
@@ -83,7 +99,7 @@ def _dedup_matches(matches: list) -> list:
     for m in matches:
         key = (
             (m.info.artist or "").lower(),
-            (m.info.title or "").lower(),
+            normalize_title(m.info.title or ""),
             getattr(m.info, "trackdisambig", None) or "",
         )
         groups.setdefault(key, []).append(m)
@@ -129,7 +145,7 @@ def _get_candidates_sync(file_path: Path) -> TagResult:
     item = Item.from_path(str(file_path))
     proposal = tag_item(item)
     candidates = []
-    for i, match in enumerate(_dedup_matches(proposal.candidates)[:6]):
+    for i, match in enumerate(_dedup_matches(proposal.candidates)):
         info = match.info
         candidates.append(
             Candidate(
@@ -357,9 +373,20 @@ def _apply_and_stage_sync(
         )
         if enriched is not None:
             item.update(enriched)
-    item.write(path=str(file_path))
-    item.add(_lib)  # gives the item the library dir/path-formats destination() needs
+    item.add(_lib)  # attaches the library so destination() sees dir + path formats
     dest = Path(os.fsdecode(item.destination()))
+    # destination() is pure computation; drop the row so the pool beets DB isn't
+    # left with an entry pointing at the (transient) staging path. delete=False
+    # keeps the file on disk.
+    item.remove(delete=False)
+    # Surface the recording disambiguation in the title *tag* so tag-reading players
+    # (Navidrome) show e.g. "Aerials (live, 2005-06-12: Download Festival, ...)"
+    # instead of a bare "Aerials" that looks identical to the studio take. dest was
+    # already computed above from the untouched title. Idempotent on re-upload: the
+    # title is reset to the clean recording title by item.update before we append.
+    if disambig := (item.trackdisambig or "").strip():
+        item.title = f"{item.title} ({disambig})"
+    item.write(path=str(file_path))
     return file_path, dest
 
 

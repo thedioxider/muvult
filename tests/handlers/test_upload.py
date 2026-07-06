@@ -1,7 +1,165 @@
+import asyncio
 import pytest
-from src.handlers.upload import _format_status_message, FileState, _find_existing_track
-from src.models import FileStatus
+from unittest.mock import AsyncMock, MagicMock
+from src.handlers import upload
+from src.handlers.upload import _format_status_message, FileState, _find_existing_track, _top_twins
+from src.models import Candidate, FileStatus
 from src.db import init_db, get_session, Track
+
+
+def _c(index, artist, title, disambig=None):
+    return Candidate(
+        index=index, artist=artist, title=title, album="", year=None,
+        mb_track_id=f"id{index}", distance=0.0, _match=None, disambig=disambig,
+    )
+
+
+def test_top_twins_unique_top_returns_single():
+    # #0 has no same-title/artist sibling -> unambiguous, only #0 comes back.
+    cands = [_c(0, "SOAD", "Aerials"), _c(1, "SOAD", "Chop Suey!"), _c(2, "Tool", "Ænema")]
+    assert [c.index for c in _top_twins(cands)] == [0]
+
+
+def test_top_twins_groups_same_artist_title_preserving_index():
+    cands = [
+        _c(0, "System of a Down", "Aerials"),                 # studio
+        _c(1, "System of a Down", "Aerials", "live"),         # twin
+        _c(2, "System of a Down", "Toxicity"),                # different title
+        _c(3, "System of a Down", "Aerials", "radio edit"),   # twin
+    ]
+    assert [c.index for c in _top_twins(cands)] == [0, 1, 3]
+
+
+def test_top_twins_is_case_insensitive():
+    cands = [_c(0, "SOAD", "Aerials"), _c(1, "soad", "aerials", "live")]
+    assert [c.index for c in _top_twins(cands)] == [0, 1]
+
+
+def test_top_twins_empty():
+    assert _top_twins([]) == []
+
+
+def test_top_twins_normalizes_title_punctuation():
+    # Real-world case: MusicBrainz holds "ATWA" under different punctuation
+    # across recordings ("ATWA", "A.T.W.A", "Atwa"). The live "A.T.W.A" take
+    # scored as #0 must still be recognized as a twin of the studio "ATWA".
+    cands = [
+        _c(0, "System of a Down", "A.T.W.A", "live, Le Trabendo, Paris"),
+        _c(1, "System of a Down", "ATWA"),
+        _c(2, "System of a Down", "Atwa", "live, Sportpaleis, Merksem"),
+    ]
+    assert [c.index for c in _top_twins(cands)] == [0, 1, 2]
+
+
+def _req(candidates, page=0):
+    from src.models import TagResult
+    return upload._ConfirmationRequest(
+        filename="song.mp3",
+        tag_result=TagResult(candidates=candidates, recommendation=0),
+        file_path=None,
+        future=MagicMock(),
+        page=page,
+    )
+
+
+def _btn_texts(markup):
+    return [b.text for row in markup.inline_keyboard for b in row]
+
+
+def _nav_label(markup):
+    return next((t for t in _btn_texts(markup) if "/" in t), None)
+
+
+def _btn_datas(markup):
+    return [b.callback_data for row in markup.inline_keyboard for b in row]
+
+
+def test_render_list_page_first_page_of_two():
+    cands = [_c(i, "A", f"T{i}") for i in range(8)]
+    text, markup = upload._render_list_page(_req(cands, page=0))
+    assert "1. A — T0" in text and "6. A — T5" in text
+    assert "7. A — T6" not in text          # spilled to page 2
+    assert _nav_label(markup) == "1/2"      # page indicator between the arrows
+    sep = upload._CB_SEP
+    assert f"conf{sep}prev" in _btn_datas(markup)
+    assert f"conf{sep}next" in _btn_datas(markup)
+
+
+def test_render_list_page_second_page():
+    cands = [_c(i, "A", f"T{i}") for i in range(8)]
+    text, markup = upload._render_list_page(_req(cands, page=1))
+    assert "7. A — T6" in text and "8. A — T7" in text
+    assert "1. A — T0" not in text
+    assert _nav_label(markup) == "2/2"
+
+
+def test_render_list_page_single_page_has_no_nav():
+    cands = [_c(i, "A", f"T{i}") for i in range(3)]
+    _, markup = upload._render_list_page(_req(cands, page=0))
+    assert _nav_label(markup) is None       # no paging row when it all fits
+    sep = upload._CB_SEP
+    assert f"conf{sep}prev" not in _btn_datas(markup)
+
+
+def test_render_list_page_clamps_out_of_range_page():
+    cands = [_c(i, "A", f"T{i}") for i in range(8)]
+    req = _req(cands, page=9)                # past the end
+    _, markup = upload._render_list_page(req)
+    assert req.page == 1                     # clamped to the last page
+    assert _nav_label(markup) == "2/2"
+
+
+def test_render_list_page_button_carries_global_index():
+    # A page-2 button must resolve to the candidate's original index, not its
+    # position on the page.
+    cands = [_c(i, "A", f"T{i}") for i in range(8)]
+    _, markup = upload._render_list_page(_req(cands, page=1))
+    sep = upload._CB_SEP
+    datas = [b.callback_data for row in markup.inline_keyboard for b in row]
+    assert f"conf{sep}6" in datas   # candidate #7 -> index 6
+    assert f"conf{sep}7" in datas
+
+
+def test_row_sizes_first_page():
+    assert upload._row_sizes(0, True) == []
+    assert upload._row_sizes(1, True) == [1]
+    assert upload._row_sizes(2, True) == [1, 1]
+    assert upload._row_sizes(3, True) == [1, 1, 1]
+    assert upload._row_sizes(4, True) == [1, 1, 2]
+    assert upload._row_sizes(5, True) == [1, 2, 2]
+    assert upload._row_sizes(6, True) == [1, 2, 3]
+
+
+def test_row_sizes_later_page():
+    assert upload._row_sizes(0, False) == []
+    assert upload._row_sizes(1, False) == [1]
+    assert upload._row_sizes(2, False) == [1, 1]
+    assert upload._row_sizes(3, False) == [1, 1, 1]
+    assert upload._row_sizes(4, False) == [1, 1, 2]
+    assert upload._row_sizes(5, False) == [1, 2, 2]
+    assert upload._row_sizes(6, False) == [2, 2, 2]
+    assert upload._row_sizes(7, False) == [2, 2, 3]
+    assert upload._row_sizes(8, False) == [2, 3, 3]
+    assert upload._row_sizes(9, False) == [3, 3, 3]
+
+
+def test_render_list_page_first_page_button_row_shape():
+    # 6 candidates fit entirely on page 1; rows should be 1 / 2 / 3 (top pick
+    # alone, then #2-#3, then #4-#6), not the old 2-per-row pairing.
+    cands = [_c(i, "A", f"T{i}") for i in range(6)]
+    _, markup = upload._render_list_page(_req(cands, page=0))
+    candidate_rows = markup.inline_keyboard[:-1]  # drop the as-is/skip row
+    assert [len(r) for r in candidate_rows] == [1, 2, 3]
+
+
+def test_render_list_page_later_page_holds_nine():
+    # Page 1 holds 6, so page 2 starts at candidate #7 and can hold up to 9.
+    cands = [_c(i, "A", f"T{i}") for i in range(15)]
+    text, markup = upload._render_list_page(_req(cands, page=1))
+    assert "7. A — T6" in text and "15. A — T14" in text
+    assert _nav_label(markup) == "2/2"
+    candidate_rows = markup.inline_keyboard[:-2]  # drop nav row + as-is/skip row
+    assert [len(r) for r in candidate_rows] == [3, 3, 3]
 
 
 def test_format_status_groups_by_status():
@@ -68,3 +226,139 @@ async def test_find_existing_by_pool_path_for_as_is(tmp_path):
         await s.commit()
         found = await _find_existing_track(s, None, "users/alice/song.mp3")
         assert found is not None and found.pool_path == "users/alice/song.mp3"
+
+
+def test_assign_partition_joins_open_partition_under_budget():
+    # Two small files well under the char budget and track cap share partition 0.
+    batch = upload._UserBatch()
+    idx1 = upload._assign_partition(batch, "fid-A", "a.mp3")
+    idx2 = upload._assign_partition(batch, "fid-B", "b.mp3")
+    assert idx1 == 0
+    assert idx2 == 0
+    assert batch.position == {"fid-A": 0, "fid-B": 0}
+
+
+def test_assign_partition_opens_new_partition_on_char_overflow(monkeypatch):
+    # A tight budget means the second file can't fit alongside the first.
+    monkeypatch.setattr(upload, "_MSG_CHAR_BUDGET", 50)
+    batch = upload._UserBatch()
+    idx1 = upload._assign_partition(batch, "fid-A", "a" * 40)
+    idx2 = upload._assign_partition(batch, "fid-B", "b" * 40)
+    assert idx1 == 0
+    assert idx2 == 1
+
+
+def test_assign_partition_opens_new_partition_on_track_cap(monkeypatch):
+    # Track cap trips even though every file is tiny and well under budget.
+    monkeypatch.setattr(upload, "_MSG_TRACK_CAP", 2)
+    batch = upload._UserBatch()
+    idx1 = upload._assign_partition(batch, "fid-A", "a.mp3")
+    idx2 = upload._assign_partition(batch, "fid-B", "b.mp3")
+    idx3 = upload._assign_partition(batch, "fid-C", "c.mp3")
+    assert (idx1, idx2, idx3) == (0, 0, 1)
+
+
+def test_assign_partition_is_permanent():
+    # Once assigned, a file's partition never changes even as later files
+    # arrive and open further partitions.
+    batch = upload._UserBatch()
+    upload._assign_partition(batch, "fid-A", "a.mp3")
+    orig = batch.position["fid-A"]
+    for i in range(5):
+        upload._assign_partition(batch, f"fid-extra-{i}", "x" * 500)
+    assert batch.position["fid-A"] == orig
+
+
+def test_partition_states_filters_by_index():
+    batch = upload._UserBatch()
+    batch.states["a"] = FileState("a.mp3", FileStatus.DOWNLOADING)
+    batch.states["b"] = FileState("b.mp3", FileStatus.DOWNLOADING)
+    batch.position = {"a": 0, "b": 1}
+    assert set(upload._partition_states(batch, 0).keys()) == {"a"}
+    assert set(upload._partition_states(batch, 1).keys()) == {"b"}
+
+
+@pytest.mark.asyncio
+async def test_report_batch_status_edits_only_own_partition():
+    tg_id = 90001
+    batch = upload._UserBatch()
+    batch.states = {
+        "a": FileState("a.mp3", FileStatus.IMPORTED),
+        "b": FileState("b.mp3", FileStatus.DOWNLOADING),
+    }
+    batch.position = {"a": 0, "b": 1}
+    batch.message_ids = [10, 20]
+    batch.chat_id = 999
+    upload._user_batches[tg_id] = batch
+
+    bot = AsyncMock()
+    await upload._report_batch_status(bot, tg_id, "a")
+
+    bot.edit_message_text.assert_awaited_once()
+    _, kwargs = bot.edit_message_text.call_args
+    assert kwargs["message_id"] == 10
+    assert kwargs["chat_id"] == 999
+    # "b" isn't terminal yet, so the batch must still be open.
+    assert tg_id in upload._user_batches
+    upload._user_batches.pop(tg_id, None)
+
+
+@pytest.mark.asyncio
+async def test_report_batch_status_closes_when_all_terminal():
+    tg_id = 90002
+    batch = upload._UserBatch()
+    batch.states = {"a": FileState("a.mp3", FileStatus.IMPORTED)}
+    batch.position = {"a": 0}
+    batch.message_ids = [10]
+    batch.chat_id = 999
+    upload._user_batches[tg_id] = batch
+
+    bot = AsyncMock()
+    await upload._report_batch_status(bot, tg_id, "a")
+
+    assert tg_id not in upload._user_batches
+
+
+@pytest.mark.asyncio
+async def test_flush_user_batch_deletes_old_and_resends_all_partitions(monkeypatch):
+    monkeypatch.setattr(upload, "_BATCH_DEBOUNCE_SECONDS", 0.01)
+    tg_id = 90003
+    batch = upload._UserBatch()
+    batch.states = {
+        "a": FileState("a.mp3", FileStatus.DOWNLOADING),
+        "b": FileState("b.mp3", FileStatus.DOWNLOADING),
+    }
+    batch.position = {"a": 0, "b": 1}
+    batch.partition_count = 2
+    batch.message_ids = [10, 20]
+    batch.chat_id = 999
+    upload._user_batches[tg_id] = batch
+
+    bot = AsyncMock()
+    bot.send_message = AsyncMock(side_effect=[MagicMock(message_id=30), MagicMock(message_id=40)])
+
+    await upload._flush_user_batch(bot, tg_id, 999)
+
+    bot.delete_message.assert_any_call(999, 10)
+    bot.delete_message.assert_any_call(999, 20)
+    assert bot.send_message.await_count == 2
+    assert batch.message_ids == [30, 40]
+    upload._user_batches.pop(tg_id, None)
+
+
+@pytest.mark.asyncio
+async def test_flush_user_batch_closes_batch_if_all_done(monkeypatch):
+    monkeypatch.setattr(upload, "_BATCH_DEBOUNCE_SECONDS", 0.01)
+    tg_id = 90004
+    batch = upload._UserBatch()
+    batch.states = {"a": FileState("a.mp3", FileStatus.IMPORTED)}
+    batch.position = {"a": 0}
+    batch.partition_count = 1
+    upload._user_batches[tg_id] = batch
+
+    bot = AsyncMock()
+    bot.send_message = AsyncMock(return_value=MagicMock(message_id=50))
+
+    await upload._flush_user_batch(bot, tg_id, 999)
+
+    assert tg_id not in upload._user_batches

@@ -283,6 +283,7 @@ def _mk_apply_mocks(dest, *, rec=None, track_data=None, artist="half·alive"):
     item.destination.return_value = str(dest)
     item.length = 222.7
     rec = rec if rec is not None else {"id": "rec-1", "length": 200000, "releases": [{"id": "r"}]}
+    item.trackdisambig = None  # no marker appended unless a test sets one
     ti = MagicMock()
     ti.item_data = track_data if track_data is not None else {"title": "t", "artist": artist}
     ti.artist = artist
@@ -320,6 +321,69 @@ def test_apply_and_stage_sync_writes_recording_then_enriched(tmp_path):
     item.move.assert_not_called()  # placement is deferred to the caller
     assert staged == audio  # tagged in place, still in staging
     assert dest == dest_path
+
+
+def test_apply_and_stage_sync_appends_disambig_to_title(tmp_path):
+    # The recording disambiguation lives only in the pool path, so Navidrome shows a
+    # bare "Aerials" indistinguishable from the studio take. We append the full
+    # disambiguation to the title *tag*, while the pool destination is still computed
+    # from the untouched title.
+    audio = tmp_path / "song.mp3"
+    audio.write_bytes(b"audio data")
+    dest_path = tmp_path / ".pool" / "SOAD" / "Toxicity" / "Aerials (live, 2005-06-12).mp3"
+    item, plugin, rec = _mk_apply_mocks(dest_path, track_data={"title": "Aerials"})
+    item.title = "Aerials"
+    disambig = "live, 2005-06-12: Download Festival, Donington, England, UK"
+    item.trackdisambig = disambig
+
+    title_at_dest = {}
+    def _dest():  # capture the title used to compute the pool path
+        title_at_dest["title"] = item.title
+        return str(dest_path)
+    item.destination.side_effect = _dest
+
+    candidate = Candidate(
+        index=0, artist="System of a Down", title="Aerials", album="",
+        year=None, mb_track_id="rec-1", distance=0.0, _match=MagicMock(),
+    )
+
+    with (
+        patch("src.beets_svc.Item.from_path", return_value=item),
+        patch("src.beets_svc._get_recording_full", return_value=rec),
+        patch("src.beets_svc._mb_plugin", return_value=plugin),
+        patch("src.beets_svc._lib", MagicMock()),
+    ):
+        staged, dest = _apply_and_stage_sync(audio, candidate, enrich=False)
+
+    assert title_at_dest["title"] == "Aerials"          # path uses the untouched title
+    assert item.title == f"Aerials ({disambig})"        # tag gets the full disambiguation
+    assert dest == dest_path
+    item.write.assert_called_once_with(path=str(audio))
+
+
+def test_apply_and_stage_sync_no_disambig_leaves_title(tmp_path):
+    # A studio recording has no disambiguation -> the title tag is untouched.
+    audio = tmp_path / "song.mp3"
+    audio.write_bytes(b"audio data")
+    dest_path = tmp_path / ".pool" / "SOAD" / "Toxicity" / "Aerials.mp3"
+    item, plugin, rec = _mk_apply_mocks(dest_path, track_data={"title": "Aerials"})
+    item.title = "Aerials"
+    item.trackdisambig = None
+
+    candidate = Candidate(
+        index=0, artist="System of a Down", title="Aerials", album="",
+        year=None, mb_track_id="rec-1", distance=0.0, _match=MagicMock(),
+    )
+
+    with (
+        patch("src.beets_svc.Item.from_path", return_value=item),
+        patch("src.beets_svc._get_recording_full", return_value=rec),
+        patch("src.beets_svc._mb_plugin", return_value=plugin),
+        patch("src.beets_svc._lib", MagicMock()),
+    ):
+        _apply_and_stage_sync(audio, candidate, enrich=False)
+
+    assert item.title == "Aerials"
 
 
 def test_apply_and_stage_sync_enriches_with_file_length_not_recording_length(tmp_path):

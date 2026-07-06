@@ -3,14 +3,16 @@ from asyncio import get_running_loop
 import html
 import json
 import logging
-from dataclasses import dataclass
+import shutil
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from aiogram import Bot, Router
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from sqlmodel import select
 
-from ..beets_svc import get_candidates, apply_and_stage, stage_as_is
+from ..beets_svc import get_candidates, apply_and_stage, stage_as_is, normalize_title
 from ..db import Track, TrackOwnership, User, get_session
 from ..models import ConfirmationMode, FileStatus, TagResult
 from ..pool import create_symlink, pool_rel, promote_pool_file, remove_pool_file, update_symlinks
@@ -27,9 +29,117 @@ _confirmation_queues: dict[int, asyncio.Queue] = {}
 _confirmation_active: dict[int, bool] = {}
 _active_confirmations: dict[int, "_ConfirmationRequest"] = {}
 
-_group_pending: dict[str, list[tuple[str, str, int]]] = {}
-_group_meta: dict[str, tuple] = {}
-_group_tasks: dict[str, asyncio.Task] = {}
+# Per-user status-message batching. Every incoming audio/document message --
+# whether or not Telegram tagged it as part of a media group -- joins the
+# sender's batch; album files coalesce into it purely because they arrive
+# within the debounce window of each other, no group_id special-casing needed.
+_MSG_CHAR_BUDGET = 4096 * 2 // 3  # Telegram's hard message-text cap is 4096 chars
+_MSG_TRACK_CAP = 32  # backstop for many short filenames whose overhead adds up
+_LINE_OVERHEAD = 24  # approx markup + note-text allowance per file line
+_BATCH_DEBOUNCE_SECONDS = 1.0
+
+
+@dataclass
+class _UserBatch:
+    states: dict[str, "FileState"] = field(default_factory=dict)
+    position: dict[str, int] = field(default_factory=dict)  # file_id -> partition index (stable once set)
+    open_chars: int = 0  # running estimated length of the still-open (last) partition
+    open_count: int = 0  # file count of the still-open (last) partition
+    partition_count: int = 0
+    chat_id: int | None = None
+    message_ids: list[int] = field(default_factory=list)  # one per partition, replaced wholesale on each flush
+
+
+_user_batches: dict[int, _UserBatch] = {}
+_batch_locks: dict[int, asyncio.Lock] = {}
+_batch_debounce_tasks: dict[int, asyncio.Task] = {}
+
+
+def _get_batch_lock(tg_id: int) -> asyncio.Lock:
+    return _batch_locks.setdefault(tg_id, asyncio.Lock())
+
+
+def _estimate_line_chars(filename: str) -> int:
+    return len(html.escape(filename)) + _LINE_OVERHEAD
+
+
+def _assign_partition(batch: _UserBatch, file_id: str, filename: str) -> int:
+    """Pick the partition (== Telegram message) a new file lands in.
+
+    A file joins the current open partition unless doing so would overflow its
+    estimated char budget or its track cap, in which case a new partition opens.
+    Assignment is permanent -- a file never moves to a different partition once
+    set, so each message's formatting stays self-contained (own status-group
+    headers), never split mid-listing across two messages.
+    """
+    est = _estimate_line_chars(filename)
+    overflow = (
+        batch.partition_count == 0
+        or batch.open_count >= _MSG_TRACK_CAP
+        or batch.open_chars + est > _MSG_CHAR_BUDGET
+    )
+    if overflow:
+        batch.partition_count += 1
+        batch.open_chars = 0
+        batch.open_count = 0
+    idx = batch.partition_count - 1
+    batch.open_chars += est
+    batch.open_count += 1
+    batch.position[file_id] = idx
+    return idx
+
+
+def _partition_states(batch: _UserBatch, idx: int) -> dict[str, "FileState"]:
+    return {fid: st for fid, st in batch.states.items() if batch.position[fid] == idx}
+
+
+def _maybe_close_batch(tg_id: int, batch: _UserBatch) -> None:
+    all_done = all(fs.status in _TERMINAL for fs in batch.states.values())
+    task = _batch_debounce_tasks.get(tg_id)
+    timer_pending = task is not None and not task.done()
+    if all_done and not timer_pending and _user_batches.get(tg_id) is batch:
+        _user_batches.pop(tg_id, None)
+
+
+async def _report_batch_status(bot: Bot, tg_id: int, file_id: str) -> None:
+    async with _get_batch_lock(tg_id):
+        batch = _user_batches.get(tg_id)
+        if batch is None or file_id not in batch.position:
+            return
+        idx = batch.position[file_id]
+        if idx < len(batch.message_ids):
+            text = _format_status_message(_partition_states(batch, idx))
+            try:
+                await bot.edit_message_text(
+                    text, chat_id=batch.chat_id, message_id=batch.message_ids[idx], parse_mode="HTML"
+                )
+            except Exception:
+                pass
+        _maybe_close_batch(tg_id, batch)
+
+
+async def _flush_user_batch(bot: Bot, tg_id: int, chat_id: int) -> None:
+    try:
+        await asyncio.sleep(_BATCH_DEBOUNCE_SECONDS)
+    except asyncio.CancelledError:
+        return
+    async with _get_batch_lock(tg_id):
+        batch = _user_batches.get(tg_id)
+        if batch is None:
+            return
+        for msg_id in batch.message_ids:
+            try:
+                await bot.delete_message(chat_id, msg_id)
+            except Exception:
+                pass
+        batch.message_ids = []
+        for idx in range(batch.partition_count):
+            text = _format_status_message(_partition_states(batch, idx))
+            msg = await bot.send_message(chat_id, text, parse_mode="HTML")
+            batch.message_ids.append(msg.message_id)
+        batch.chat_id = chat_id
+        _batch_debounce_tasks.pop(tg_id, None)
+        _maybe_close_batch(tg_id, batch)
 
 # Guards the pool-write + DB-commit critical section in _process_file so
 # concurrent uploads of the same track can't collide on the unique pool_path.
@@ -77,6 +187,29 @@ async def _find_existing_track(session, mb_id: str | None, pool_path: str):
     return result.first()
 
 
+def _top_twins(candidates: list) -> list:
+    """Candidate #0 together with any same-(artist, title) 'twins'.
+
+    After dedup, two candidates sharing artist and title differ only by
+    disambiguation -- distinct MB recordings of the "same" track (a live take, a
+    radio edit, ...). Title comparison is loose (punctuation-insensitive, e.g.
+    "ATWA" == "A.T.W.A") since MusicBrainz submissions spell the same title
+    inconsistently -- a false-positive twin here just adds a harmless extra
+    choice to the prompt below, so it's safe to err on catching more. This
+    returns #0 and every such twin, in list order, so a single-element result
+    means the top match is unambiguous. Each Candidate keeps its original
+    ``.index`` (its position in the full list), which the confirmation
+    callbacks resolve against.
+    """
+    if not candidates:
+        return []
+    key = (candidates[0].artist.lower(), normalize_title(candidates[0].title, loose=True))
+    return [
+        c for c in candidates
+        if (c.artist.lower(), normalize_title(c.title, loose=True)) == key
+    ]
+
+
 @dataclass
 class FileState:
     original_name: str
@@ -120,19 +253,115 @@ def _candidate_detail(c) -> str:
     return f" [{', '.join(bits)}]" if bits else ""
 
 
+_FIRST_PAGE_SIZE = 6  # page 1 reserves row 1 for the lone top pick, losing 3 slots
+_PAGE_SIZE = 9  # every later page is a full 3x3 grid
+
+
+def _row_sizes(n: int, is_first_page: bool) -> list[int]:
+    """Row sizes (top to bottom) for laying out ``n`` candidates in <=3 rows.
+
+    Rows are non-decreasing top-to-bottom with adjacent rows differing by at
+    most 1 button, so a page never reads as lopsided (a near-empty row next to
+    a full one). On the first page, row 1 is hard-locked to the lone top
+    pick -- highlighting it -- and the rest of ``n`` is balanced evenly across
+    the remaining two rows. Every other page has no locked row: all of ``n``
+    balances evenly across up to 3 rows. Empty rows are omitted.
+    """
+    if n <= 0:
+        return []
+    if is_first_page:
+        rows = [1]
+        remaining = n - 1
+        if remaining > 0:
+            row2 = remaining // 2
+            row3 = remaining - row2
+            if row2 > 0:
+                rows.append(row2)
+            rows.append(row3)
+        return rows
+    rows_count = min(3, n)
+    base, rem = divmod(n, rows_count)
+    threshold = rows_count - rem
+    return [base + (1 if i >= threshold else 0) for i in range(rows_count)]
+
+
+def _page_bounds(total: int, page: int) -> tuple[int, int]:
+    """Start/end candidate indices (into the full list) for a 0-based page."""
+    if page == 0:
+        return 0, min(total, _FIRST_PAGE_SIZE)
+    start = _FIRST_PAGE_SIZE + (page - 1) * _PAGE_SIZE
+    return start, min(total, start + _PAGE_SIZE)
+
+
+def _total_pages(total: int) -> int:
+    if total <= _FIRST_PAGE_SIZE:
+        return 1
+    return 1 + -(-(total - _FIRST_PAGE_SIZE) // _PAGE_SIZE)
+
+
 @dataclass
 class _ConfirmationRequest:
     filename: str
     tag_result: TagResult
     file_path: Path
     future: asyncio.Future
+    page: int = 0
+    # Set once the prompt is actually sent (_ask_confirmation); lets the callback
+    # handler check the click came from *this* message, not a stale one left over
+    # from a crash/restart -- cheaper than embedding an id in callback_data, and
+    # frees callback_data to hold only the choice (filenames alone can already
+    # blow Telegram's 64-byte callback_data cap, see BUTTON_DATA_INVALID).
+    message_id: int | None = None
 
 
-async def _edit_status(bot: Bot, chat_id: int, msg_id: int, states: dict[str, FileState]) -> None:
-    try:
-        await bot.edit_message_text(_format_status_message(states), chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
-    except Exception:
-        pass
+def _render_list_page(req: "_ConfirmationRequest") -> tuple[str, InlineKeyboardMarkup]:
+    """Render one page of the candidate list, with paging controls when needed.
+
+    Page 1 holds ``_FIRST_PAGE_SIZE`` candidates, every later page holds
+    ``_PAGE_SIZE`` (see ``_page_bounds``/``_total_pages``); row layout within a
+    page comes from ``_row_sizes``. Each candidate keeps its global number
+    (``.index + 1``), and its button carries the original ``.index`` so the
+    selection resolves against the full list regardless of the current page.
+    When there is more than one page a nav row (``<<`` / ``page/total`` /
+    ``>>``) is added; ``req.page`` is clamped here so the caller can bump it
+    freely. Mutates ``req.page`` to the clamped value.
+    """
+    cands = req.tag_result.candidates
+    pages = _total_pages(len(cands))
+    req.page = max(0, min(req.page, pages - 1))
+    start, end = _page_bounds(len(cands), req.page)
+    fname = html.escape(req.filename)
+
+    text = f"❓ Matches for:\n<i>{fname}</i>\n\n"
+    page_cands = cands[start:end]
+    sizes = _row_sizes(len(page_cands), req.page == 0)
+
+    rows: list[list[InlineKeyboardButton]] = []
+    it = iter(page_cands)
+    for size in sizes:
+        row: list[InlineKeyboardButton] = []
+        for c in (next(it) for _ in range(size)):
+            n = c.index + 1
+            artist = html.escape(c.artist)
+            title = html.escape(c.title)
+            text += f"{n}. {artist} — {title}{_candidate_detail(c)}\n"
+            row.append(InlineKeyboardButton(
+                text=f"#{n} ({(1 - c.distance) * 100:.0f}%)",
+                callback_data=f"conf{_CB_SEP}{c.index}",
+            ))
+        rows.append(row)
+
+    if pages > 1:
+        rows.append([
+            InlineKeyboardButton(text="<<", callback_data=f"conf{_CB_SEP}prev"),
+            InlineKeyboardButton(text=f"{req.page + 1}/{pages}", callback_data=f"conf{_CB_SEP}noop"),
+            InlineKeyboardButton(text=">>", callback_data=f"conf{_CB_SEP}next"),
+        ])
+    rows.append([
+        InlineKeyboardButton(text="Import as-is", callback_data=f"conf{_CB_SEP}asis"),
+        InlineKeyboardButton(text="Skip", callback_data=f"conf{_CB_SEP}skip"),
+    ])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def _ask_confirmation(bot: Bot, tg_id: int, req: "_ConfirmationRequest") -> None:
@@ -140,8 +369,8 @@ async def _ask_confirmation(bot: Bot, tg_id: int, req: "_ConfirmationRequest") -
     fname = html.escape(req.filename)
     if not tag.candidates:
         buttons = [[
-            InlineKeyboardButton(text="Import as-is", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}asis"),
-            InlineKeyboardButton(text="Skip", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}skip"),
+            InlineKeyboardButton(text="Import as-is", callback_data=f"conf{_CB_SEP}asis"),
+            InlineKeyboardButton(text="Skip", callback_data=f"conf{_CB_SEP}skip"),
         ]]
         text = f"❌ No matches found for:\n<i>{fname}</i>"
     elif tag.recommendation >= 3:
@@ -154,58 +383,48 @@ async def _ask_confirmation(bot: Bot, tg_id: int, req: "_ConfirmationRequest") -
             f"Confidence: <b>{(1 - c.distance) * 100:.0f}%</b>"
         )
         buttons = [[
-            InlineKeyboardButton(text="Import", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}0"),
-            InlineKeyboardButton(text="See others", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}list"),
-            InlineKeyboardButton(text="Skip", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}skip"),
+            InlineKeyboardButton(text="Import", callback_data=f"conf{_CB_SEP}0"),
+            InlineKeyboardButton(text="See others", callback_data=f"conf{_CB_SEP}list"),
+            InlineKeyboardButton(text="Skip", callback_data=f"conf{_CB_SEP}skip"),
         ]]
     else:
-        text = f"❓ Matches for:\n<i>{fname}</i>\n"
-        rows = []
-        for i, c in enumerate(tag.candidates[:6]):
-            artist = html.escape(c.artist)
-            title = html.escape(c.title)
-            text += f"{i + 1}. {artist} — {title}{_candidate_detail(c)}\n"
-            new_button = InlineKeyboardButton(
-                    text=f"#{i + 1} ({(1 - c.distance) * 100:.0f}%)",
-                    callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}{c.index}",
-                )
-            if i % 2 == 0:
-                rows.append([new_button])
-            else:
-                rows[-1].append(new_button)
-        rows.append([
-            InlineKeyboardButton(text="Import as-is", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}asis"),
-            InlineKeyboardButton(text="Skip", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}skip"),
-        ])
-        buttons = rows
+        text, markup = _render_list_page(req)
+        msg = await bot.send_message(tg_id, text, reply_markup=markup, parse_mode="HTML")
+        req.message_id = msg.message_id
+        return
 
-    await bot.send_message(tg_id, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+    msg = await bot.send_message(tg_id, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+    req.message_id = msg.message_id
 
 
 async def _process_file(
     bot: Bot,
     tg_id: int,
     user_id: int,
-    file_msg_id: int | None,
     filename: str,
     file_id: str,
     states: dict[str, FileState],
-    status_chat_id: int,
-    status_msg_id: int,
+    report: Callable[[], Awaitable[None]],
 ) -> None:
     from ..config import settings
 
     staging_dir = Path(settings.staging_root) / str(tg_id)
-    staging_dir.mkdir(parents=True, exist_ok=True)
-    file_path = staging_dir / filename
+    # Each file gets its own subdir keyed by the unique file_id so two files that
+    # share a name (common within one album) neither clobber each other on disk
+    # nor collide in the status dict. The filename -- and its extension, which
+    # as-is naming reuses -- is preserved inside. states is likewise keyed by
+    # file_id, with the filename kept only for display.
+    file_dir = staging_dir / file_id
+    file_dir.mkdir(parents=True, exist_ok=True)
+    file_path = file_dir / filename
 
     try:
-        states[filename] = FileState(filename, FileStatus.DOWNLOADING)
-        await _edit_status(bot, status_chat_id, status_msg_id, states)
+        states[file_id] = FileState(filename, FileStatus.DOWNLOADING)
+        await report()
         await bot.download(file_id, destination=file_path)
 
-        states[filename].status = FileStatus.TAGGING
-        await _edit_status(bot, status_chat_id, status_msg_id, states)
+        states[file_id].status = FileStatus.TAGGING
+        await report()
         tag_result = await get_candidates(file_path)
 
         async with get_session() as session:
@@ -221,19 +440,31 @@ async def _process_file(
         if mode == ConfirmationMode.OFF:
             chosen_index = 0 if (is_high and tag_result.candidates) else "asis"
         elif mode == ConfirmationMode.AUTO and is_high and tag_result.candidates:
-            chosen_index = 0
+            twins = _top_twins(tag_result.candidates)
+            if len(twins) == 1:
+                chosen_index = 0  # unique high-confidence match: import without asking
+            else:
+                # High confidence, but candidate #0 has same-artist+title twins that
+                # dedup kept apart by disambiguation (a live take, a radio edit, ...).
+                # We can't tell which the user meant, so prompt -- but only among the
+                # twins, not the whole list. The buttons carry each candidate's
+                # original .index (its position in the full list), so the int result
+                # still resolves against tag_result.candidates below.
+                chosen_index = await _queue_confirmation(
+                    bot, tg_id, file_id, filename,
+                    TagResult(candidates=twins, recommendation=0),
+                    file_path, states, report,
+                )
         else:
             while True:
-                chosen_index = await _queue_confirmation(bot, tg_id, filename, tag_result, file_path, states, status_chat_id, status_msg_id)
+                chosen_index = await _queue_confirmation(bot, tg_id, file_id, filename, tag_result, file_path, states, report)
                 if chosen_index != "list":
                     break
                 tag_result.recommendation = 0
 
         if chosen_index is None:
-            states[filename] = FileState(filename, FileStatus.SKIPPED)
-            await _edit_status(bot, status_chat_id, status_msg_id, states)
-            if file_path.exists():
-                file_path.unlink()
+            states[file_id] = FileState(filename, FileStatus.SKIPPED)
+            await report()
             return
 
         is_asis = chosen_index == "asis"
@@ -320,28 +551,31 @@ async def _process_file(
             await session.commit()
 
         if already_owned:
-            states[filename] = FileState(filename, FileStatus.DUPLICATE)
+            states[file_id] = FileState(filename, FileStatus.DUPLICATE)
         else:
-            states[filename] = FileState(filename, FileStatus.IMPORTED, note)
-        await _edit_status(bot, status_chat_id, status_msg_id, states)
+            states[file_id] = FileState(filename, FileStatus.IMPORTED, note)
+        await report()
 
     except Exception as e:
         log.exception("processing %s failed", filename)
-        states[filename] = FileState(filename, FileStatus.FAILED, str(e)[:80])
-        await _edit_status(bot, status_chat_id, status_msg_id, states)
-        if file_path.exists():
-            file_path.unlink()
+        states[file_id] = FileState(filename, FileStatus.FAILED, str(e)[:80])
+        await report()
+    finally:
+        # Drop the per-file staging dir (and any leftover download) on every
+        # exit -- imported files were already moved into the pool, the rest are
+        # scratch. The sidecar reaper is a backstop for crashes, not this path.
+        shutil.rmtree(file_dir, ignore_errors=True)
 
 
 async def _queue_confirmation(
     bot: Bot,
     tg_id: int,
+    file_id: str,
     filename: str,
     tag_result: TagResult,
     file_path: Path,
     states: dict[str, FileState],
-    status_chat_id: int,
-    status_msg_id: int,
+    report: Callable[[], Awaitable[None]],
 ) -> int | str | None:
     future: asyncio.Future = get_running_loop().create_future()
 
@@ -351,8 +585,8 @@ async def _queue_confirmation(
         _confirmation_queues[tg_id] = asyncio.Queue()
 
     await _confirmation_queues[tg_id].put(req)
-    states[filename].status = FileStatus.PENDING
-    await _edit_status(bot, status_chat_id, status_msg_id, states)
+    states[file_id].status = FileStatus.PENDING
+    await report()
 
     if not _confirmation_active.get(tg_id):
         _confirmation_active[tg_id] = True
@@ -382,12 +616,29 @@ async def _drain_confirmation_queue(bot: Bot, tg_id: int) -> None:
 
 @upload_router.callback_query(lambda c: c.data and c.data.startswith(f"conf{_CB_SEP}"))
 async def cb_confirmation(callback: CallbackQuery, bot: Bot) -> None:
-    _, filename, choice = callback.data.split(_CB_SEP, 2)
+    _, choice = callback.data.split(_CB_SEP, 1)
     tg_id = callback.from_user.id
 
     req = _active_confirmations.get(tg_id)
-    if not req or req.filename != filename or req.future.done():
+    if (
+        not req
+        or req.future.done()
+        or not callback.message
+        or req.message_id != callback.message.message_id
+    ):
         await safe_answer(callback, "No pending confirmation")
+        return
+
+    if choice in ("prev", "next", "noop"):
+        # Paging: re-render the list in place; the pending choice is untouched.
+        if choice != "noop":
+            req.page += 1 if choice == "next" else -1
+            text, markup = _render_list_page(req)  # clamps req.page
+            try:
+                await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+            except Exception:
+                pass  # e.g. "message is not modified" at a page boundary
+        await safe_answer(callback)
         return
 
     if choice == "skip":
@@ -407,24 +658,6 @@ async def cb_confirmation(callback: CallbackQuery, bot: Bot) -> None:
     await safe_answer(callback)
 
 
-async def _flush_group(group_id: str) -> None:
-    await asyncio.sleep(0.5)
-    files = _group_pending.pop(group_id, [])
-    meta = _group_meta.pop(group_id, None)
-    _group_tasks.pop(group_id, None)
-    if not files or meta is None:
-        return
-    bot, tg_id, user_id, chat_id = meta
-    states: dict[str, FileState] = {f[0]: FileState(f[0], FileStatus.DOWNLOADING) for f in files}
-    status_msg = await bot.send_message(chat_id, _format_status_message(states), parse_mode="HTML")
-    for filename, file_id, file_msg_id in files:
-        asyncio.create_task(_process_file(
-            bot=bot, tg_id=tg_id, user_id=user_id,
-            file_msg_id=file_msg_id, filename=filename, file_id=file_id,
-            states=states, status_chat_id=chat_id, status_msg_id=status_msg.message_id,
-        ))
-
-
 @upload_router.message(lambda m: m.audio or m.document)
 async def handle_audio(message: Message, bot: Bot) -> None:
     tg_id = message.from_user.id
@@ -440,17 +673,23 @@ async def handle_audio(message: Message, bot: Bot) -> None:
         return
     user_id = row.id
 
-    group_id = message.media_group_id
-    if group_id:
-        _group_pending.setdefault(group_id, []).append((filename, audio.file_id, message.message_id))
-        _group_meta[group_id] = (bot, tg_id, user_id, message.chat.id)
-        if group_id not in _group_tasks:
-            _group_tasks[group_id] = asyncio.create_task(_flush_group(group_id))
-    else:
-        states: dict[str, FileState] = {filename: FileState(filename, FileStatus.DOWNLOADING)}
-        status_msg = await message.answer(_format_status_message(states), parse_mode="HTML")
-        asyncio.create_task(_process_file(
-            bot=bot, tg_id=tg_id, user_id=user_id,
-            file_msg_id=message.message_id, filename=filename, file_id=audio.file_id,
-            states=states, status_chat_id=message.chat.id, status_msg_id=status_msg.message_id,
-        ))
+    file_id = audio.file_id
+    async with _get_batch_lock(tg_id):
+        batch = _user_batches.setdefault(tg_id, _UserBatch())
+        batch.states[file_id] = FileState(filename, FileStatus.DOWNLOADING)
+        _assign_partition(batch, file_id, filename)
+
+        old_task = _batch_debounce_tasks.get(tg_id)
+        if old_task:
+            old_task.cancel()
+        _batch_debounce_tasks[tg_id] = asyncio.create_task(
+            _flush_user_batch(bot, tg_id, message.chat.id)
+        )
+        states = batch.states
+
+    asyncio.create_task(_process_file(
+        bot=bot, tg_id=tg_id, user_id=user_id,
+        filename=filename, file_id=file_id,
+        states=states,
+        report=lambda: _report_batch_status(bot, tg_id, file_id),
+    ))
