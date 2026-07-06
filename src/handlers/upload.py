@@ -3,6 +3,7 @@ from asyncio import get_running_loop
 import html
 import json
 import logging
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -196,15 +197,21 @@ async def _process_file(
     from ..config import settings
 
     staging_dir = Path(settings.staging_root) / str(tg_id)
-    staging_dir.mkdir(parents=True, exist_ok=True)
-    file_path = staging_dir / filename
+    # Each file gets its own subdir keyed by the unique file_id so two files that
+    # share a name (common within one album) neither clobber each other on disk
+    # nor collide in the status dict. The filename -- and its extension, which
+    # as-is naming reuses -- is preserved inside. states is likewise keyed by
+    # file_id, with the filename kept only for display.
+    file_dir = staging_dir / file_id
+    file_dir.mkdir(parents=True, exist_ok=True)
+    file_path = file_dir / filename
 
     try:
-        states[filename] = FileState(filename, FileStatus.DOWNLOADING)
+        states[file_id] = FileState(filename, FileStatus.DOWNLOADING)
         await _edit_status(bot, status_chat_id, status_msg_id, states)
         await bot.download(file_id, destination=file_path)
 
-        states[filename].status = FileStatus.TAGGING
+        states[file_id].status = FileStatus.TAGGING
         await _edit_status(bot, status_chat_id, status_msg_id, states)
         tag_result = await get_candidates(file_path)
 
@@ -224,16 +231,14 @@ async def _process_file(
             chosen_index = 0
         else:
             while True:
-                chosen_index = await _queue_confirmation(bot, tg_id, filename, tag_result, file_path, states, status_chat_id, status_msg_id)
+                chosen_index = await _queue_confirmation(bot, tg_id, file_id, filename, tag_result, file_path, states, status_chat_id, status_msg_id)
                 if chosen_index != "list":
                     break
                 tag_result.recommendation = 0
 
         if chosen_index is None:
-            states[filename] = FileState(filename, FileStatus.SKIPPED)
+            states[file_id] = FileState(filename, FileStatus.SKIPPED)
             await _edit_status(bot, status_chat_id, status_msg_id, states)
-            if file_path.exists():
-                file_path.unlink()
             return
 
         is_asis = chosen_index == "asis"
@@ -320,22 +325,26 @@ async def _process_file(
             await session.commit()
 
         if already_owned:
-            states[filename] = FileState(filename, FileStatus.DUPLICATE)
+            states[file_id] = FileState(filename, FileStatus.DUPLICATE)
         else:
-            states[filename] = FileState(filename, FileStatus.IMPORTED, note)
+            states[file_id] = FileState(filename, FileStatus.IMPORTED, note)
         await _edit_status(bot, status_chat_id, status_msg_id, states)
 
     except Exception as e:
         log.exception("processing %s failed", filename)
-        states[filename] = FileState(filename, FileStatus.FAILED, str(e)[:80])
+        states[file_id] = FileState(filename, FileStatus.FAILED, str(e)[:80])
         await _edit_status(bot, status_chat_id, status_msg_id, states)
-        if file_path.exists():
-            file_path.unlink()
+    finally:
+        # Drop the per-file staging dir (and any leftover download) on every
+        # exit -- imported files were already moved into the pool, the rest are
+        # scratch. The sidecar reaper is a backstop for crashes, not this path.
+        shutil.rmtree(file_dir, ignore_errors=True)
 
 
 async def _queue_confirmation(
     bot: Bot,
     tg_id: int,
+    file_id: str,
     filename: str,
     tag_result: TagResult,
     file_path: Path,
@@ -351,7 +360,7 @@ async def _queue_confirmation(
         _confirmation_queues[tg_id] = asyncio.Queue()
 
     await _confirmation_queues[tg_id].put(req)
-    states[filename].status = FileStatus.PENDING
+    states[file_id].status = FileStatus.PENDING
     await _edit_status(bot, status_chat_id, status_msg_id, states)
 
     if not _confirmation_active.get(tg_id):
@@ -415,7 +424,8 @@ async def _flush_group(group_id: str) -> None:
     if not files or meta is None:
         return
     bot, tg_id, user_id, chat_id = meta
-    states: dict[str, FileState] = {f[0]: FileState(f[0], FileStatus.DOWNLOADING) for f in files}
+    # keyed by file_id (f[1]); filename (f[0]) is display only
+    states: dict[str, FileState] = {f[1]: FileState(f[0], FileStatus.DOWNLOADING) for f in files}
     status_msg = await bot.send_message(chat_id, _format_status_message(states), parse_mode="HTML")
     for filename, file_id, file_msg_id in files:
         asyncio.create_task(_process_file(
@@ -447,7 +457,7 @@ async def handle_audio(message: Message, bot: Bot) -> None:
         if group_id not in _group_tasks:
             _group_tasks[group_id] = asyncio.create_task(_flush_group(group_id))
     else:
-        states: dict[str, FileState] = {filename: FileState(filename, FileStatus.DOWNLOADING)}
+        states: dict[str, FileState] = {audio.file_id: FileState(filename, FileStatus.DOWNLOADING)}
         status_msg = await message.answer(_format_status_message(states), parse_mode="HTML")
         asyncio.create_task(_process_file(
             bot=bot, tg_id=tg_id, user_id=user_id,

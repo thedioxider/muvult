@@ -1,4 +1,7 @@
+import asyncio
 import pytest
+from unittest.mock import AsyncMock, MagicMock
+from src.handlers import upload
 from src.handlers.upload import _format_status_message, FileState, _find_existing_track
 from src.models import FileStatus
 from src.db import init_db, get_session, Track
@@ -68,3 +71,26 @@ async def test_find_existing_by_pool_path_for_as_is(tmp_path):
         await s.commit()
         found = await _find_existing_track(s, None, "users/alice/song.mp3")
         assert found is not None and found.pool_path == "users/alice/song.mp3"
+
+
+@pytest.mark.asyncio
+async def test_flush_group_keys_states_by_file_id(monkeypatch):
+    # Two files sharing a name (common in an album) must not collide: states is
+    # keyed by the unique file_id, with the filename kept only for display.
+    gid = "grp"
+    upload._group_pending[gid] = [("song.mp3", "fid-A", 1), ("song.mp3", "fid-B", 2)]
+    bot = AsyncMock()
+    bot.send_message = AsyncMock(return_value=MagicMock(message_id=10))
+    upload._group_meta[gid] = (bot, 1, 1, 99)
+
+    captured: dict = {}
+
+    async def fake_process(**kwargs):
+        captured["states"] = kwargs["states"]
+
+    monkeypatch.setattr(upload, "_process_file", fake_process)
+    await upload._flush_group(gid)
+    await asyncio.sleep(0.05)  # let the spawned per-file tasks run
+
+    assert set(captured["states"].keys()) == {"fid-A", "fid-B"}
+    assert [fs.original_name for fs in captured["states"].values()] == ["song.mp3", "song.mp3"]
