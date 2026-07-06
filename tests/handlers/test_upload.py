@@ -69,8 +69,8 @@ def test_render_list_page_first_page_of_two():
     assert "7. A — T6" not in text          # spilled to page 2
     assert _nav_label(markup) == "1/2"      # page indicator between the arrows
     sep = upload._CB_SEP
-    assert f"conf{sep}song.mp3{sep}prev" in _btn_datas(markup)
-    assert f"conf{sep}song.mp3{sep}next" in _btn_datas(markup)
+    assert f"conf{sep}prev" in _btn_datas(markup)
+    assert f"conf{sep}next" in _btn_datas(markup)
 
 
 def test_render_list_page_second_page():
@@ -86,7 +86,7 @@ def test_render_list_page_single_page_has_no_nav():
     _, markup = upload._render_list_page(_req(cands, page=0))
     assert _nav_label(markup) is None       # no paging row when it all fits
     sep = upload._CB_SEP
-    assert f"conf{sep}song.mp3{sep}prev" not in _btn_datas(markup)
+    assert f"conf{sep}prev" not in _btn_datas(markup)
 
 
 def test_render_list_page_clamps_out_of_range_page():
@@ -104,8 +104,8 @@ def test_render_list_page_button_carries_global_index():
     _, markup = upload._render_list_page(_req(cands, page=1))
     sep = upload._CB_SEP
     datas = [b.callback_data for row in markup.inline_keyboard for b in row]
-    assert f"conf{sep}song.mp3{sep}6" in datas   # candidate #7 -> index 6
-    assert f"conf{sep}song.mp3{sep}7" in datas
+    assert f"conf{sep}6" in datas   # candidate #7 -> index 6
+    assert f"conf{sep}7" in datas
 
 
 def test_format_status_groups_by_status():

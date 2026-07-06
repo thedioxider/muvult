@@ -147,6 +147,12 @@ class _ConfirmationRequest:
     file_path: Path
     future: asyncio.Future
     page: int = 0
+    # Set once the prompt is actually sent (_ask_confirmation); lets the callback
+    # handler check the click came from *this* message, not a stale one left over
+    # from a crash/restart -- cheaper than embedding an id in callback_data, and
+    # frees callback_data to hold only the choice (filenames alone can already
+    # blow Telegram's 64-byte callback_data cap, see BUTTON_DATA_INVALID).
+    message_id: int | None = None
 
 
 def _render_list_page(req: "_ConfirmationRequest") -> tuple[str, InlineKeyboardMarkup]:
@@ -174,7 +180,7 @@ def _render_list_page(req: "_ConfirmationRequest") -> tuple[str, InlineKeyboardM
         text += f"{n}. {artist} — {title}{_candidate_detail(c)}\n"
         btn = InlineKeyboardButton(
             text=f"#{n} ({(1 - c.distance) * 100:.0f}%)",
-            callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}{c.index}",
+            callback_data=f"conf{_CB_SEP}{c.index}",
         )
         if rows and len(rows[-1]) == 1:
             rows[-1].append(btn)
@@ -183,13 +189,13 @@ def _render_list_page(req: "_ConfirmationRequest") -> tuple[str, InlineKeyboardM
 
     if pages > 1:
         rows.append([
-            InlineKeyboardButton(text="<<", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}prev"),
-            InlineKeyboardButton(text=f"{req.page + 1}/{pages}", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}noop"),
-            InlineKeyboardButton(text=">>", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}next"),
+            InlineKeyboardButton(text="<<", callback_data=f"conf{_CB_SEP}prev"),
+            InlineKeyboardButton(text=f"{req.page + 1}/{pages}", callback_data=f"conf{_CB_SEP}noop"),
+            InlineKeyboardButton(text=">>", callback_data=f"conf{_CB_SEP}next"),
         ])
     rows.append([
-        InlineKeyboardButton(text="Import as-is", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}asis"),
-        InlineKeyboardButton(text="Skip", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}skip"),
+        InlineKeyboardButton(text="Import as-is", callback_data=f"conf{_CB_SEP}asis"),
+        InlineKeyboardButton(text="Skip", callback_data=f"conf{_CB_SEP}skip"),
     ])
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -206,8 +212,8 @@ async def _ask_confirmation(bot: Bot, tg_id: int, req: "_ConfirmationRequest") -
     fname = html.escape(req.filename)
     if not tag.candidates:
         buttons = [[
-            InlineKeyboardButton(text="Import as-is", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}asis"),
-            InlineKeyboardButton(text="Skip", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}skip"),
+            InlineKeyboardButton(text="Import as-is", callback_data=f"conf{_CB_SEP}asis"),
+            InlineKeyboardButton(text="Skip", callback_data=f"conf{_CB_SEP}skip"),
         ]]
         text = f"❌ No matches found for:\n<i>{fname}</i>"
     elif tag.recommendation >= 3:
@@ -220,16 +226,18 @@ async def _ask_confirmation(bot: Bot, tg_id: int, req: "_ConfirmationRequest") -
             f"Confidence: <b>{(1 - c.distance) * 100:.0f}%</b>"
         )
         buttons = [[
-            InlineKeyboardButton(text="Import", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}0"),
-            InlineKeyboardButton(text="See others", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}list"),
-            InlineKeyboardButton(text="Skip", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}skip"),
+            InlineKeyboardButton(text="Import", callback_data=f"conf{_CB_SEP}0"),
+            InlineKeyboardButton(text="See others", callback_data=f"conf{_CB_SEP}list"),
+            InlineKeyboardButton(text="Skip", callback_data=f"conf{_CB_SEP}skip"),
         ]]
     else:
         text, markup = _render_list_page(req)
-        await bot.send_message(tg_id, text, reply_markup=markup, parse_mode="HTML")
+        msg = await bot.send_message(tg_id, text, reply_markup=markup, parse_mode="HTML")
+        req.message_id = msg.message_id
         return
 
-    await bot.send_message(tg_id, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+    msg = await bot.send_message(tg_id, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+    req.message_id = msg.message_id
 
 
 async def _process_file(
@@ -453,11 +461,16 @@ async def _drain_confirmation_queue(bot: Bot, tg_id: int) -> None:
 
 @upload_router.callback_query(lambda c: c.data and c.data.startswith(f"conf{_CB_SEP}"))
 async def cb_confirmation(callback: CallbackQuery, bot: Bot) -> None:
-    _, filename, choice = callback.data.split(_CB_SEP, 2)
+    _, choice = callback.data.split(_CB_SEP, 1)
     tg_id = callback.from_user.id
 
     req = _active_confirmations.get(tg_id)
-    if not req or req.filename != filename or req.future.done():
+    if (
+        not req
+        or req.future.done()
+        or not callback.message
+        or req.message_id != callback.message.message_id
+    ):
         await safe_answer(callback, "No pending confirmation")
         return
 
