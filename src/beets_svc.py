@@ -129,7 +129,7 @@ def _get_candidates_sync(file_path: Path) -> TagResult:
     item = Item.from_path(str(file_path))
     proposal = tag_item(item)
     candidates = []
-    for i, match in enumerate(_dedup_matches(proposal.candidates)[:6]):
+    for i, match in enumerate(_dedup_matches(proposal.candidates)):
         info = match.info
         candidates.append(
             Candidate(

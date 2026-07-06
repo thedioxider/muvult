@@ -39,6 +39,75 @@ def test_top_twins_empty():
     assert _top_twins([]) == []
 
 
+def _req(candidates, page=0):
+    from src.models import TagResult
+    return upload._ConfirmationRequest(
+        filename="song.mp3",
+        tag_result=TagResult(candidates=candidates, recommendation=0),
+        file_path=None,
+        future=MagicMock(),
+        page=page,
+    )
+
+
+def _btn_texts(markup):
+    return [b.text for row in markup.inline_keyboard for b in row]
+
+
+def _nav_label(markup):
+    return next((t for t in _btn_texts(markup) if "/" in t), None)
+
+
+def _btn_datas(markup):
+    return [b.callback_data for row in markup.inline_keyboard for b in row]
+
+
+def test_render_list_page_first_page_of_two():
+    cands = [_c(i, "A", f"T{i}") for i in range(8)]
+    text, markup = upload._render_list_page(_req(cands, page=0))
+    assert "1. A — T0" in text and "6. A — T5" in text
+    assert "7. A — T6" not in text          # spilled to page 2
+    assert _nav_label(markup) == "1/2"      # page indicator between the arrows
+    sep = upload._CB_SEP
+    assert f"conf{sep}song.mp3{sep}prev" in _btn_datas(markup)
+    assert f"conf{sep}song.mp3{sep}next" in _btn_datas(markup)
+
+
+def test_render_list_page_second_page():
+    cands = [_c(i, "A", f"T{i}") for i in range(8)]
+    text, markup = upload._render_list_page(_req(cands, page=1))
+    assert "7. A — T6" in text and "8. A — T7" in text
+    assert "1. A — T0" not in text
+    assert _nav_label(markup) == "2/2"
+
+
+def test_render_list_page_single_page_has_no_nav():
+    cands = [_c(i, "A", f"T{i}") for i in range(3)]
+    _, markup = upload._render_list_page(_req(cands, page=0))
+    assert _nav_label(markup) is None       # no paging row when it all fits
+    sep = upload._CB_SEP
+    assert f"conf{sep}song.mp3{sep}prev" not in _btn_datas(markup)
+
+
+def test_render_list_page_clamps_out_of_range_page():
+    cands = [_c(i, "A", f"T{i}") for i in range(8)]
+    req = _req(cands, page=9)                # past the end
+    _, markup = upload._render_list_page(req)
+    assert req.page == 1                     # clamped to the last page
+    assert _nav_label(markup) == "2/2"
+
+
+def test_render_list_page_button_carries_global_index():
+    # A page-2 button must resolve to the candidate's original index, not its
+    # position on the page.
+    cands = [_c(i, "A", f"T{i}") for i in range(8)]
+    _, markup = upload._render_list_page(_req(cands, page=1))
+    sep = upload._CB_SEP
+    datas = [b.callback_data for row in markup.inline_keyboard for b in row]
+    assert f"conf{sep}song.mp3{sep}6" in datas   # candidate #7 -> index 6
+    assert f"conf{sep}song.mp3{sep}7" in datas
+
+
 def test_format_status_groups_by_status():
     states = {
         "a.mp3": FileState("a.mp3", FileStatus.DOWNLOADING),

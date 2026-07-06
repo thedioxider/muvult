@@ -137,12 +137,61 @@ def _candidate_detail(c) -> str:
     return f" [{', '.join(bits)}]" if bits else ""
 
 
+_PAGE_SIZE = 6
+
+
 @dataclass
 class _ConfirmationRequest:
     filename: str
     tag_result: TagResult
     file_path: Path
     future: asyncio.Future
+    page: int = 0
+
+
+def _render_list_page(req: "_ConfirmationRequest") -> tuple[str, InlineKeyboardMarkup]:
+    """Render one page of the candidate list, with paging controls when needed.
+
+    Candidates are shown ``_PAGE_SIZE`` at a time. Each candidate keeps its global
+    number (``.index + 1``), and its button carries the original ``.index`` so the
+    selection resolves against the full list regardless of the current page. When
+    there is more than one page a nav row (⬅️ / ``page/total`` / ➡️) is added;
+    ``req.page`` is clamped here so the caller can bump it freely. Mutates
+    ``req.page`` to the clamped value.
+    """
+    cands = req.tag_result.candidates
+    pages = max(1, (len(cands) + _PAGE_SIZE - 1) // _PAGE_SIZE)
+    req.page = max(0, min(req.page, pages - 1))
+    start = req.page * _PAGE_SIZE
+    fname = html.escape(req.filename)
+
+    text = f"❓ Matches for:\n<i>{fname}</i>\n\n"
+    rows: list[list[InlineKeyboardButton]] = []
+    for c in cands[start:start + _PAGE_SIZE]:
+        n = c.index + 1
+        artist = html.escape(c.artist)
+        title = html.escape(c.title)
+        text += f"{n}. {artist} — {title}{_candidate_detail(c)}\n"
+        btn = InlineKeyboardButton(
+            text=f"#{n} ({(1 - c.distance) * 100:.0f}%)",
+            callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}{c.index}",
+        )
+        if rows and len(rows[-1]) == 1:
+            rows[-1].append(btn)
+        else:
+            rows.append([btn])
+
+    if pages > 1:
+        rows.append([
+            InlineKeyboardButton(text="<<", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}prev"),
+            InlineKeyboardButton(text=f"{req.page + 1}/{pages}", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}noop"),
+            InlineKeyboardButton(text=">>", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}next"),
+        ])
+    rows.append([
+        InlineKeyboardButton(text="Import as-is", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}asis"),
+        InlineKeyboardButton(text="Skip", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}skip"),
+    ])
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def _edit_status(bot: Bot, chat_id: int, msg_id: int, states: dict[str, FileState]) -> None:
@@ -176,25 +225,9 @@ async def _ask_confirmation(bot: Bot, tg_id: int, req: "_ConfirmationRequest") -
             InlineKeyboardButton(text="Skip", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}skip"),
         ]]
     else:
-        text = f"❓ Matches for:\n<i>{fname}</i>\n"
-        rows = []
-        for i, c in enumerate(tag.candidates[:6]):
-            artist = html.escape(c.artist)
-            title = html.escape(c.title)
-            text += f"{i + 1}. {artist} — {title}{_candidate_detail(c)}\n"
-            new_button = InlineKeyboardButton(
-                    text=f"#{i + 1} ({(1 - c.distance) * 100:.0f}%)",
-                    callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}{c.index}",
-                )
-            if i % 2 == 0:
-                rows.append([new_button])
-            else:
-                rows[-1].append(new_button)
-        rows.append([
-            InlineKeyboardButton(text="Import as-is", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}asis"),
-            InlineKeyboardButton(text="Skip", callback_data=f"conf{_CB_SEP}{req.filename}{_CB_SEP}skip"),
-        ])
-        buttons = rows
+        text, markup = _render_list_page(req)
+        await bot.send_message(tg_id, text, reply_markup=markup, parse_mode="HTML")
+        return
 
     await bot.send_message(tg_id, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
 
@@ -426,6 +459,18 @@ async def cb_confirmation(callback: CallbackQuery, bot: Bot) -> None:
     req = _active_confirmations.get(tg_id)
     if not req or req.filename != filename or req.future.done():
         await safe_answer(callback, "No pending confirmation")
+        return
+
+    if choice in ("prev", "next", "noop"):
+        # Paging: re-render the list in place; the pending choice is untouched.
+        if choice != "noop":
+            req.page += 1 if choice == "next" else -1
+            text, markup = _render_list_page(req)  # clamps req.page
+            try:
+                await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+            except Exception:
+                pass  # e.g. "message is not modified" at a page boundary
+        await safe_answer(callback)
         return
 
     if choice == "skip":
