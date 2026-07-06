@@ -120,6 +120,48 @@ def test_render_list_page_button_carries_global_index():
     assert f"conf{sep}7" in datas
 
 
+def test_row_sizes_first_page():
+    assert upload._row_sizes(0, True) == []
+    assert upload._row_sizes(1, True) == [1]
+    assert upload._row_sizes(2, True) == [1, 1]
+    assert upload._row_sizes(3, True) == [1, 1, 1]
+    assert upload._row_sizes(4, True) == [1, 1, 2]
+    assert upload._row_sizes(5, True) == [1, 2, 2]
+    assert upload._row_sizes(6, True) == [1, 2, 3]
+
+
+def test_row_sizes_later_page():
+    assert upload._row_sizes(0, False) == []
+    assert upload._row_sizes(1, False) == [1]
+    assert upload._row_sizes(2, False) == [1, 1]
+    assert upload._row_sizes(3, False) == [1, 1, 1]
+    assert upload._row_sizes(4, False) == [1, 1, 2]
+    assert upload._row_sizes(5, False) == [1, 2, 2]
+    assert upload._row_sizes(6, False) == [2, 2, 2]
+    assert upload._row_sizes(7, False) == [2, 2, 3]
+    assert upload._row_sizes(8, False) == [2, 3, 3]
+    assert upload._row_sizes(9, False) == [3, 3, 3]
+
+
+def test_render_list_page_first_page_button_row_shape():
+    # 6 candidates fit entirely on page 1; rows should be 1 / 2 / 3 (top pick
+    # alone, then #2-#3, then #4-#6), not the old 2-per-row pairing.
+    cands = [_c(i, "A", f"T{i}") for i in range(6)]
+    _, markup = upload._render_list_page(_req(cands, page=0))
+    candidate_rows = markup.inline_keyboard[:-1]  # drop the as-is/skip row
+    assert [len(r) for r in candidate_rows] == [1, 2, 3]
+
+
+def test_render_list_page_later_page_holds_nine():
+    # Page 1 holds 6, so page 2 starts at candidate #7 and can hold up to 9.
+    cands = [_c(i, "A", f"T{i}") for i in range(15)]
+    text, markup = upload._render_list_page(_req(cands, page=1))
+    assert "7. A — T6" in text and "15. A — T14" in text
+    assert _nav_label(markup) == "2/2"
+    candidate_rows = markup.inline_keyboard[:-2]  # drop nav row + as-is/skip row
+    assert [len(r) for r in candidate_rows] == [3, 3, 3]
+
+
 def test_format_status_groups_by_status():
     states = {
         "a.mp3": FileState("a.mp3", FileStatus.DOWNLOADING),

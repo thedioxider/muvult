@@ -253,7 +253,50 @@ def _candidate_detail(c) -> str:
     return f" [{', '.join(bits)}]" if bits else ""
 
 
-_PAGE_SIZE = 6
+_FIRST_PAGE_SIZE = 6  # page 1 reserves row 1 for the lone top pick, losing 3 slots
+_PAGE_SIZE = 9  # every later page is a full 3x3 grid
+
+
+def _row_sizes(n: int, is_first_page: bool) -> list[int]:
+    """Row sizes (top to bottom) for laying out ``n`` candidates in <=3 rows.
+
+    Rows are non-decreasing top-to-bottom with adjacent rows differing by at
+    most 1 button, so a page never reads as lopsided (a near-empty row next to
+    a full one). On the first page, row 1 is hard-locked to the lone top
+    pick -- highlighting it -- and the rest of ``n`` is balanced evenly across
+    the remaining two rows. Every other page has no locked row: all of ``n``
+    balances evenly across up to 3 rows. Empty rows are omitted.
+    """
+    if n <= 0:
+        return []
+    if is_first_page:
+        rows = [1]
+        remaining = n - 1
+        if remaining > 0:
+            row2 = remaining // 2
+            row3 = remaining - row2
+            if row2 > 0:
+                rows.append(row2)
+            rows.append(row3)
+        return rows
+    rows_count = min(3, n)
+    base, rem = divmod(n, rows_count)
+    threshold = rows_count - rem
+    return [base + (1 if i >= threshold else 0) for i in range(rows_count)]
+
+
+def _page_bounds(total: int, page: int) -> tuple[int, int]:
+    """Start/end candidate indices (into the full list) for a 0-based page."""
+    if page == 0:
+        return 0, min(total, _FIRST_PAGE_SIZE)
+    start = _FIRST_PAGE_SIZE + (page - 1) * _PAGE_SIZE
+    return start, min(total, start + _PAGE_SIZE)
+
+
+def _total_pages(total: int) -> int:
+    if total <= _FIRST_PAGE_SIZE:
+        return 1
+    return 1 + -(-(total - _FIRST_PAGE_SIZE) // _PAGE_SIZE)
 
 
 @dataclass
@@ -274,34 +317,39 @@ class _ConfirmationRequest:
 def _render_list_page(req: "_ConfirmationRequest") -> tuple[str, InlineKeyboardMarkup]:
     """Render one page of the candidate list, with paging controls when needed.
 
-    Candidates are shown ``_PAGE_SIZE`` at a time. Each candidate keeps its global
-    number (``.index + 1``), and its button carries the original ``.index`` so the
-    selection resolves against the full list regardless of the current page. When
-    there is more than one page a nav row (⬅️ / ``page/total`` / ➡️) is added;
-    ``req.page`` is clamped here so the caller can bump it freely. Mutates
-    ``req.page`` to the clamped value.
+    Page 1 holds ``_FIRST_PAGE_SIZE`` candidates, every later page holds
+    ``_PAGE_SIZE`` (see ``_page_bounds``/``_total_pages``); row layout within a
+    page comes from ``_row_sizes``. Each candidate keeps its global number
+    (``.index + 1``), and its button carries the original ``.index`` so the
+    selection resolves against the full list regardless of the current page.
+    When there is more than one page a nav row (``<<`` / ``page/total`` /
+    ``>>``) is added; ``req.page`` is clamped here so the caller can bump it
+    freely. Mutates ``req.page`` to the clamped value.
     """
     cands = req.tag_result.candidates
-    pages = max(1, (len(cands) + _PAGE_SIZE - 1) // _PAGE_SIZE)
+    pages = _total_pages(len(cands))
     req.page = max(0, min(req.page, pages - 1))
-    start = req.page * _PAGE_SIZE
+    start, end = _page_bounds(len(cands), req.page)
     fname = html.escape(req.filename)
 
     text = f"❓ Matches for:\n<i>{fname}</i>\n\n"
+    page_cands = cands[start:end]
+    sizes = _row_sizes(len(page_cands), req.page == 0)
+
     rows: list[list[InlineKeyboardButton]] = []
-    for c in cands[start:start + _PAGE_SIZE]:
-        n = c.index + 1
-        artist = html.escape(c.artist)
-        title = html.escape(c.title)
-        text += f"{n}. {artist} — {title}{_candidate_detail(c)}\n"
-        btn = InlineKeyboardButton(
-            text=f"#{n} ({(1 - c.distance) * 100:.0f}%)",
-            callback_data=f"conf{_CB_SEP}{c.index}",
-        )
-        if rows and len(rows[-1]) == 1:
-            rows[-1].append(btn)
-        else:
-            rows.append([btn])
+    it = iter(page_cands)
+    for size in sizes:
+        row: list[InlineKeyboardButton] = []
+        for c in (next(it) for _ in range(size)):
+            n = c.index + 1
+            artist = html.escape(c.artist)
+            title = html.escape(c.title)
+            text += f"{n}. {artist} — {title}{_candidate_detail(c)}\n"
+            row.append(InlineKeyboardButton(
+                text=f"#{n} ({(1 - c.distance) * 100:.0f}%)",
+                callback_data=f"conf{_CB_SEP}{c.index}",
+            ))
+        rows.append(row)
 
     if pages > 1:
         rows.append([
