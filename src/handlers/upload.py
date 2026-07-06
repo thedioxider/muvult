@@ -4,7 +4,8 @@ import html
 import json
 import logging
 import shutil
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from aiogram import Bot, Router
@@ -28,9 +29,117 @@ _confirmation_queues: dict[int, asyncio.Queue] = {}
 _confirmation_active: dict[int, bool] = {}
 _active_confirmations: dict[int, "_ConfirmationRequest"] = {}
 
-_group_pending: dict[str, list[tuple[str, str]]] = {}
-_group_meta: dict[str, tuple] = {}
-_group_tasks: dict[str, asyncio.Task] = {}
+# Per-user status-message batching. Every incoming audio/document message --
+# whether or not Telegram tagged it as part of a media group -- joins the
+# sender's batch; album files coalesce into it purely because they arrive
+# within the debounce window of each other, no group_id special-casing needed.
+_MSG_CHAR_BUDGET = 4096 * 2 // 3  # Telegram's hard message-text cap is 4096 chars
+_MSG_TRACK_CAP = 32  # backstop for many short filenames whose overhead adds up
+_LINE_OVERHEAD = 24  # approx markup + note-text allowance per file line
+_BATCH_DEBOUNCE_SECONDS = 1.0
+
+
+@dataclass
+class _UserBatch:
+    states: dict[str, "FileState"] = field(default_factory=dict)
+    position: dict[str, int] = field(default_factory=dict)  # file_id -> partition index (stable once set)
+    open_chars: int = 0  # running estimated length of the still-open (last) partition
+    open_count: int = 0  # file count of the still-open (last) partition
+    partition_count: int = 0
+    chat_id: int | None = None
+    message_ids: list[int] = field(default_factory=list)  # one per partition, replaced wholesale on each flush
+
+
+_user_batches: dict[int, _UserBatch] = {}
+_batch_locks: dict[int, asyncio.Lock] = {}
+_batch_debounce_tasks: dict[int, asyncio.Task] = {}
+
+
+def _get_batch_lock(tg_id: int) -> asyncio.Lock:
+    return _batch_locks.setdefault(tg_id, asyncio.Lock())
+
+
+def _estimate_line_chars(filename: str) -> int:
+    return len(html.escape(filename)) + _LINE_OVERHEAD
+
+
+def _assign_partition(batch: _UserBatch, file_id: str, filename: str) -> int:
+    """Pick the partition (== Telegram message) a new file lands in.
+
+    A file joins the current open partition unless doing so would overflow its
+    estimated char budget or its track cap, in which case a new partition opens.
+    Assignment is permanent -- a file never moves to a different partition once
+    set, so each message's formatting stays self-contained (own status-group
+    headers), never split mid-listing across two messages.
+    """
+    est = _estimate_line_chars(filename)
+    overflow = (
+        batch.partition_count == 0
+        or batch.open_count >= _MSG_TRACK_CAP
+        or batch.open_chars + est > _MSG_CHAR_BUDGET
+    )
+    if overflow:
+        batch.partition_count += 1
+        batch.open_chars = 0
+        batch.open_count = 0
+    idx = batch.partition_count - 1
+    batch.open_chars += est
+    batch.open_count += 1
+    batch.position[file_id] = idx
+    return idx
+
+
+def _partition_states(batch: _UserBatch, idx: int) -> dict[str, "FileState"]:
+    return {fid: st for fid, st in batch.states.items() if batch.position[fid] == idx}
+
+
+def _maybe_close_batch(tg_id: int, batch: _UserBatch) -> None:
+    all_done = all(fs.status in _TERMINAL for fs in batch.states.values())
+    task = _batch_debounce_tasks.get(tg_id)
+    timer_pending = task is not None and not task.done()
+    if all_done and not timer_pending and _user_batches.get(tg_id) is batch:
+        _user_batches.pop(tg_id, None)
+
+
+async def _report_batch_status(bot: Bot, tg_id: int, file_id: str) -> None:
+    async with _get_batch_lock(tg_id):
+        batch = _user_batches.get(tg_id)
+        if batch is None or file_id not in batch.position:
+            return
+        idx = batch.position[file_id]
+        if idx < len(batch.message_ids):
+            text = _format_status_message(_partition_states(batch, idx))
+            try:
+                await bot.edit_message_text(
+                    text, chat_id=batch.chat_id, message_id=batch.message_ids[idx], parse_mode="HTML"
+                )
+            except Exception:
+                pass
+        _maybe_close_batch(tg_id, batch)
+
+
+async def _flush_user_batch(bot: Bot, tg_id: int, chat_id: int) -> None:
+    try:
+        await asyncio.sleep(_BATCH_DEBOUNCE_SECONDS)
+    except asyncio.CancelledError:
+        return
+    async with _get_batch_lock(tg_id):
+        batch = _user_batches.get(tg_id)
+        if batch is None:
+            return
+        for msg_id in batch.message_ids:
+            try:
+                await bot.delete_message(chat_id, msg_id)
+            except Exception:
+                pass
+        batch.message_ids = []
+        for idx in range(batch.partition_count):
+            text = _format_status_message(_partition_states(batch, idx))
+            msg = await bot.send_message(chat_id, text, parse_mode="HTML")
+            batch.message_ids.append(msg.message_id)
+        batch.chat_id = chat_id
+        _batch_debounce_tasks.pop(tg_id, None)
+        _maybe_close_batch(tg_id, batch)
 
 # Guards the pool-write + DB-commit critical section in _process_file so
 # concurrent uploads of the same track can't collide on the unique pool_path.
@@ -207,13 +316,6 @@ def _render_list_page(req: "_ConfirmationRequest") -> tuple[str, InlineKeyboardM
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def _edit_status(bot: Bot, chat_id: int, msg_id: int, states: dict[str, FileState]) -> None:
-    try:
-        await bot.edit_message_text(_format_status_message(states), chat_id=chat_id, message_id=msg_id, parse_mode="HTML")
-    except Exception:
-        pass
-
-
 async def _ask_confirmation(bot: Bot, tg_id: int, req: "_ConfirmationRequest") -> None:
     tag = req.tag_result
     fname = html.escape(req.filename)
@@ -254,8 +356,7 @@ async def _process_file(
     filename: str,
     file_id: str,
     states: dict[str, FileState],
-    status_chat_id: int,
-    status_msg_id: int,
+    report: Callable[[], Awaitable[None]],
 ) -> None:
     from ..config import settings
 
@@ -271,11 +372,11 @@ async def _process_file(
 
     try:
         states[file_id] = FileState(filename, FileStatus.DOWNLOADING)
-        await _edit_status(bot, status_chat_id, status_msg_id, states)
+        await report()
         await bot.download(file_id, destination=file_path)
 
         states[file_id].status = FileStatus.TAGGING
-        await _edit_status(bot, status_chat_id, status_msg_id, states)
+        await report()
         tag_result = await get_candidates(file_path)
 
         async with get_session() as session:
@@ -304,18 +405,18 @@ async def _process_file(
                 chosen_index = await _queue_confirmation(
                     bot, tg_id, file_id, filename,
                     TagResult(candidates=twins, recommendation=0),
-                    file_path, states, status_chat_id, status_msg_id,
+                    file_path, states, report,
                 )
         else:
             while True:
-                chosen_index = await _queue_confirmation(bot, tg_id, file_id, filename, tag_result, file_path, states, status_chat_id, status_msg_id)
+                chosen_index = await _queue_confirmation(bot, tg_id, file_id, filename, tag_result, file_path, states, report)
                 if chosen_index != "list":
                     break
                 tag_result.recommendation = 0
 
         if chosen_index is None:
             states[file_id] = FileState(filename, FileStatus.SKIPPED)
-            await _edit_status(bot, status_chat_id, status_msg_id, states)
+            await report()
             return
 
         is_asis = chosen_index == "asis"
@@ -405,12 +506,12 @@ async def _process_file(
             states[file_id] = FileState(filename, FileStatus.DUPLICATE)
         else:
             states[file_id] = FileState(filename, FileStatus.IMPORTED, note)
-        await _edit_status(bot, status_chat_id, status_msg_id, states)
+        await report()
 
     except Exception as e:
         log.exception("processing %s failed", filename)
         states[file_id] = FileState(filename, FileStatus.FAILED, str(e)[:80])
-        await _edit_status(bot, status_chat_id, status_msg_id, states)
+        await report()
     finally:
         # Drop the per-file staging dir (and any leftover download) on every
         # exit -- imported files were already moved into the pool, the rest are
@@ -426,8 +527,7 @@ async def _queue_confirmation(
     tag_result: TagResult,
     file_path: Path,
     states: dict[str, FileState],
-    status_chat_id: int,
-    status_msg_id: int,
+    report: Callable[[], Awaitable[None]],
 ) -> int | str | None:
     future: asyncio.Future = get_running_loop().create_future()
 
@@ -438,7 +538,7 @@ async def _queue_confirmation(
 
     await _confirmation_queues[tg_id].put(req)
     states[file_id].status = FileStatus.PENDING
-    await _edit_status(bot, status_chat_id, status_msg_id, states)
+    await report()
 
     if not _confirmation_active.get(tg_id):
         _confirmation_active[tg_id] = True
@@ -510,25 +610,6 @@ async def cb_confirmation(callback: CallbackQuery, bot: Bot) -> None:
     await safe_answer(callback)
 
 
-async def _flush_group(group_id: str) -> None:
-    await asyncio.sleep(0.5)
-    files = _group_pending.pop(group_id, [])
-    meta = _group_meta.pop(group_id, None)
-    _group_tasks.pop(group_id, None)
-    if not files or meta is None:
-        return
-    bot, tg_id, user_id, chat_id = meta
-    # keyed by file_id (f[1]); filename (f[0]) is display only
-    states: dict[str, FileState] = {f[1]: FileState(f[0], FileStatus.DOWNLOADING) for f in files}
-    status_msg = await bot.send_message(chat_id, _format_status_message(states), parse_mode="HTML")
-    for filename, file_id in files:
-        asyncio.create_task(_process_file(
-            bot=bot, tg_id=tg_id, user_id=user_id,
-            filename=filename, file_id=file_id,
-            states=states, status_chat_id=chat_id, status_msg_id=status_msg.message_id,
-        ))
-
-
 @upload_router.message(lambda m: m.audio or m.document)
 async def handle_audio(message: Message, bot: Bot) -> None:
     tg_id = message.from_user.id
@@ -544,17 +625,23 @@ async def handle_audio(message: Message, bot: Bot) -> None:
         return
     user_id = row.id
 
-    group_id = message.media_group_id
-    if group_id:
-        _group_pending.setdefault(group_id, []).append((filename, audio.file_id))
-        _group_meta[group_id] = (bot, tg_id, user_id, message.chat.id)
-        if group_id not in _group_tasks:
-            _group_tasks[group_id] = asyncio.create_task(_flush_group(group_id))
-    else:
-        states: dict[str, FileState] = {audio.file_id: FileState(filename, FileStatus.DOWNLOADING)}
-        status_msg = await message.answer(_format_status_message(states), parse_mode="HTML")
-        asyncio.create_task(_process_file(
-            bot=bot, tg_id=tg_id, user_id=user_id,
-            filename=filename, file_id=audio.file_id,
-            states=states, status_chat_id=message.chat.id, status_msg_id=status_msg.message_id,
-        ))
+    file_id = audio.file_id
+    async with _get_batch_lock(tg_id):
+        batch = _user_batches.setdefault(tg_id, _UserBatch())
+        batch.states[file_id] = FileState(filename, FileStatus.DOWNLOADING)
+        _assign_partition(batch, file_id, filename)
+
+        old_task = _batch_debounce_tasks.get(tg_id)
+        if old_task:
+            old_task.cancel()
+        _batch_debounce_tasks[tg_id] = asyncio.create_task(
+            _flush_user_batch(bot, tg_id, message.chat.id)
+        )
+        states = batch.states
+
+    asyncio.create_task(_process_file(
+        bot=bot, tg_id=tg_id, user_id=user_id,
+        filename=filename, file_id=file_id,
+        states=states,
+        report=lambda: _report_batch_status(bot, tg_id, file_id),
+    ))

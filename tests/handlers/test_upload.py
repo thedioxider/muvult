@@ -186,24 +186,137 @@ async def test_find_existing_by_pool_path_for_as_is(tmp_path):
         assert found is not None and found.pool_path == "users/alice/song.mp3"
 
 
+def test_assign_partition_joins_open_partition_under_budget():
+    # Two small files well under the char budget and track cap share partition 0.
+    batch = upload._UserBatch()
+    idx1 = upload._assign_partition(batch, "fid-A", "a.mp3")
+    idx2 = upload._assign_partition(batch, "fid-B", "b.mp3")
+    assert idx1 == 0
+    assert idx2 == 0
+    assert batch.position == {"fid-A": 0, "fid-B": 0}
+
+
+def test_assign_partition_opens_new_partition_on_char_overflow(monkeypatch):
+    # A tight budget means the second file can't fit alongside the first.
+    monkeypatch.setattr(upload, "_MSG_CHAR_BUDGET", 50)
+    batch = upload._UserBatch()
+    idx1 = upload._assign_partition(batch, "fid-A", "a" * 40)
+    idx2 = upload._assign_partition(batch, "fid-B", "b" * 40)
+    assert idx1 == 0
+    assert idx2 == 1
+
+
+def test_assign_partition_opens_new_partition_on_track_cap(monkeypatch):
+    # Track cap trips even though every file is tiny and well under budget.
+    monkeypatch.setattr(upload, "_MSG_TRACK_CAP", 2)
+    batch = upload._UserBatch()
+    idx1 = upload._assign_partition(batch, "fid-A", "a.mp3")
+    idx2 = upload._assign_partition(batch, "fid-B", "b.mp3")
+    idx3 = upload._assign_partition(batch, "fid-C", "c.mp3")
+    assert (idx1, idx2, idx3) == (0, 0, 1)
+
+
+def test_assign_partition_is_permanent():
+    # Once assigned, a file's partition never changes even as later files
+    # arrive and open further partitions.
+    batch = upload._UserBatch()
+    upload._assign_partition(batch, "fid-A", "a.mp3")
+    orig = batch.position["fid-A"]
+    for i in range(5):
+        upload._assign_partition(batch, f"fid-extra-{i}", "x" * 500)
+    assert batch.position["fid-A"] == orig
+
+
+def test_partition_states_filters_by_index():
+    batch = upload._UserBatch()
+    batch.states["a"] = FileState("a.mp3", FileStatus.DOWNLOADING)
+    batch.states["b"] = FileState("b.mp3", FileStatus.DOWNLOADING)
+    batch.position = {"a": 0, "b": 1}
+    assert set(upload._partition_states(batch, 0).keys()) == {"a"}
+    assert set(upload._partition_states(batch, 1).keys()) == {"b"}
+
+
 @pytest.mark.asyncio
-async def test_flush_group_keys_states_by_file_id(monkeypatch):
-    # Two files sharing a name (common in an album) must not collide: states is
-    # keyed by the unique file_id, with the filename kept only for display.
-    gid = "grp"
-    upload._group_pending[gid] = [("song.mp3", "fid-A"), ("song.mp3", "fid-B")]
+async def test_report_batch_status_edits_only_own_partition():
+    tg_id = 90001
+    batch = upload._UserBatch()
+    batch.states = {
+        "a": FileState("a.mp3", FileStatus.IMPORTED),
+        "b": FileState("b.mp3", FileStatus.DOWNLOADING),
+    }
+    batch.position = {"a": 0, "b": 1}
+    batch.message_ids = [10, 20]
+    batch.chat_id = 999
+    upload._user_batches[tg_id] = batch
+
     bot = AsyncMock()
-    bot.send_message = AsyncMock(return_value=MagicMock(message_id=10))
-    upload._group_meta[gid] = (bot, 1, 1, 99)
+    await upload._report_batch_status(bot, tg_id, "a")
 
-    captured: dict = {}
+    bot.edit_message_text.assert_awaited_once()
+    _, kwargs = bot.edit_message_text.call_args
+    assert kwargs["message_id"] == 10
+    assert kwargs["chat_id"] == 999
+    # "b" isn't terminal yet, so the batch must still be open.
+    assert tg_id in upload._user_batches
+    upload._user_batches.pop(tg_id, None)
 
-    async def fake_process(**kwargs):
-        captured["states"] = kwargs["states"]
 
-    monkeypatch.setattr(upload, "_process_file", fake_process)
-    await upload._flush_group(gid)
-    await asyncio.sleep(0.05)  # let the spawned per-file tasks run
+@pytest.mark.asyncio
+async def test_report_batch_status_closes_when_all_terminal():
+    tg_id = 90002
+    batch = upload._UserBatch()
+    batch.states = {"a": FileState("a.mp3", FileStatus.IMPORTED)}
+    batch.position = {"a": 0}
+    batch.message_ids = [10]
+    batch.chat_id = 999
+    upload._user_batches[tg_id] = batch
 
-    assert set(captured["states"].keys()) == {"fid-A", "fid-B"}
-    assert [fs.original_name for fs in captured["states"].values()] == ["song.mp3", "song.mp3"]
+    bot = AsyncMock()
+    await upload._report_batch_status(bot, tg_id, "a")
+
+    assert tg_id not in upload._user_batches
+
+
+@pytest.mark.asyncio
+async def test_flush_user_batch_deletes_old_and_resends_all_partitions(monkeypatch):
+    monkeypatch.setattr(upload, "_BATCH_DEBOUNCE_SECONDS", 0.01)
+    tg_id = 90003
+    batch = upload._UserBatch()
+    batch.states = {
+        "a": FileState("a.mp3", FileStatus.DOWNLOADING),
+        "b": FileState("b.mp3", FileStatus.DOWNLOADING),
+    }
+    batch.position = {"a": 0, "b": 1}
+    batch.partition_count = 2
+    batch.message_ids = [10, 20]
+    batch.chat_id = 999
+    upload._user_batches[tg_id] = batch
+
+    bot = AsyncMock()
+    bot.send_message = AsyncMock(side_effect=[MagicMock(message_id=30), MagicMock(message_id=40)])
+
+    await upload._flush_user_batch(bot, tg_id, 999)
+
+    bot.delete_message.assert_any_call(999, 10)
+    bot.delete_message.assert_any_call(999, 20)
+    assert bot.send_message.await_count == 2
+    assert batch.message_ids == [30, 40]
+    upload._user_batches.pop(tg_id, None)
+
+
+@pytest.mark.asyncio
+async def test_flush_user_batch_closes_batch_if_all_done(monkeypatch):
+    monkeypatch.setattr(upload, "_BATCH_DEBOUNCE_SECONDS", 0.01)
+    tg_id = 90004
+    batch = upload._UserBatch()
+    batch.states = {"a": FileState("a.mp3", FileStatus.IMPORTED)}
+    batch.position = {"a": 0}
+    batch.partition_count = 1
+    upload._user_batches[tg_id] = batch
+
+    bot = AsyncMock()
+    bot.send_message = AsyncMock(return_value=MagicMock(message_id=50))
+
+    await upload._flush_user_batch(bot, tg_id, 999)
+
+    assert tg_id not in upload._user_batches
