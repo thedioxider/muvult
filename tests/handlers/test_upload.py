@@ -78,7 +78,7 @@ async def test_flush_group_keys_states_by_file_id(monkeypatch):
     # Two files sharing a name (common in an album) must not collide: states is
     # keyed by the unique file_id, with the filename kept only for display.
     gid = "grp"
-    upload._group_pending[gid] = [("song.mp3", "fid-A", 1), ("song.mp3", "fid-B", 2)]
+    upload._group_pending[gid] = [("song.mp3", "fid-A"), ("song.mp3", "fid-B")]
     bot = AsyncMock()
     bot.send_message = AsyncMock(return_value=MagicMock(message_id=10))
     upload._group_meta[gid] = (bot, 1, 1, 99)

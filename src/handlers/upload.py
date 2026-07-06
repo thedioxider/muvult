@@ -28,7 +28,7 @@ _confirmation_queues: dict[int, asyncio.Queue] = {}
 _confirmation_active: dict[int, bool] = {}
 _active_confirmations: dict[int, "_ConfirmationRequest"] = {}
 
-_group_pending: dict[str, list[tuple[str, str, int]]] = {}
+_group_pending: dict[str, list[tuple[str, str]]] = {}
 _group_meta: dict[str, tuple] = {}
 _group_tasks: dict[str, asyncio.Task] = {}
 
@@ -187,7 +187,6 @@ async def _process_file(
     bot: Bot,
     tg_id: int,
     user_id: int,
-    file_msg_id: int | None,
     filename: str,
     file_id: str,
     states: dict[str, FileState],
@@ -427,10 +426,10 @@ async def _flush_group(group_id: str) -> None:
     # keyed by file_id (f[1]); filename (f[0]) is display only
     states: dict[str, FileState] = {f[1]: FileState(f[0], FileStatus.DOWNLOADING) for f in files}
     status_msg = await bot.send_message(chat_id, _format_status_message(states), parse_mode="HTML")
-    for filename, file_id, file_msg_id in files:
+    for filename, file_id in files:
         asyncio.create_task(_process_file(
             bot=bot, tg_id=tg_id, user_id=user_id,
-            file_msg_id=file_msg_id, filename=filename, file_id=file_id,
+            filename=filename, file_id=file_id,
             states=states, status_chat_id=chat_id, status_msg_id=status_msg.message_id,
         ))
 
@@ -452,7 +451,7 @@ async def handle_audio(message: Message, bot: Bot) -> None:
 
     group_id = message.media_group_id
     if group_id:
-        _group_pending.setdefault(group_id, []).append((filename, audio.file_id, message.message_id))
+        _group_pending.setdefault(group_id, []).append((filename, audio.file_id))
         _group_meta[group_id] = (bot, tg_id, user_id, message.chat.id)
         if group_id not in _group_tasks:
             _group_tasks[group_id] = asyncio.create_task(_flush_group(group_id))
@@ -461,6 +460,6 @@ async def handle_audio(message: Message, bot: Bot) -> None:
         status_msg = await message.answer(_format_status_message(states), parse_mode="HTML")
         asyncio.create_task(_process_file(
             bot=bot, tg_id=tg_id, user_id=user_id,
-            file_msg_id=message.message_id, filename=filename, file_id=audio.file_id,
+            filename=filename, file_id=audio.file_id,
             states=states, status_chat_id=message.chat.id, status_msg_id=status_msg.message_id,
         ))
