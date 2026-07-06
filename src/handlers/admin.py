@@ -78,7 +78,9 @@ async def _local_remove(tg_id: int) -> str | None:
 
 async def _local_rename(old: str, new: str) -> None:
     from ..config import settings
-    Path(settings.music_root, old).rename(Path(settings.music_root, new))
+    old_dir = Path(settings.music_root, old)
+    new_dir = Path(settings.music_root, new)
+    old_dir.rename(new_dir)
     async with get_session() as session:
         result = await session.exec(select(User).where(User.username == old))
         user = result.first()
@@ -88,7 +90,11 @@ async def _local_rename(old: str, new: str) -> None:
             select(TrackOwnership).where(TrackOwnership.user_id == user.id)
         )
         for ownership in result.all():
-            ownership.symlink_path = ownership.symlink_path.replace(f"/{old}/", f"/{new}/", 1)
+            # Rebase the link onto the renamed dir by path math, not string
+            # substitution -- the latter could rewrite a matching segment
+            # elsewhere in the path (e.g. an album named like the user).
+            rel = Path(ownership.symlink_path).relative_to(old_dir)
+            ownership.symlink_path = str(new_dir / rel)
         user.username = new
         await session.commit()
 
