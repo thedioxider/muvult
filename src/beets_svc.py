@@ -357,13 +357,20 @@ def _apply_and_stage_sync(
         )
         if enriched is not None:
             item.update(enriched)
-    item.write(path=str(file_path))
     item.add(_lib)  # attaches the library so destination() sees dir + path formats
     dest = Path(os.fsdecode(item.destination()))
     # destination() is pure computation; drop the row so the pool beets DB isn't
     # left with an entry pointing at the (transient) staging path. delete=False
     # keeps the file on disk.
     item.remove(delete=False)
+    # Surface the recording disambiguation in the title *tag* so tag-reading players
+    # (Navidrome) show e.g. "Aerials (live, 2005-06-12: Download Festival, ...)"
+    # instead of a bare "Aerials" that looks identical to the studio take. dest was
+    # already computed above from the untouched title. Idempotent on re-upload: the
+    # title is reset to the clean recording title by item.update before we append.
+    if disambig := (item.trackdisambig or "").strip():
+        item.title = f"{item.title} ({disambig})"
+    item.write(path=str(file_path))
     return file_path, dest
 
 
