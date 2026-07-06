@@ -358,8 +358,12 @@ def _apply_and_stage_sync(
         if enriched is not None:
             item.update(enriched)
     item.write(path=str(file_path))
-    item.add(_lib)  # gives the item the library dir/path-formats destination() needs
+    item.add(_lib)  # attaches the library so destination() sees dir + path formats
     dest = Path(os.fsdecode(item.destination()))
+    # destination() is pure computation; drop the row so the pool beets DB isn't
+    # left with an entry pointing at the (transient) staging path. delete=False
+    # keeps the file on disk.
+    item.remove(delete=False)
     return file_path, dest
 
 
