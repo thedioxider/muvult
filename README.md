@@ -19,7 +19,10 @@ uploader's library:
 - **Pool** -- `<music root>/.pool/` holds exactly one file per track, named
   `$albumartist/$album/$title`, with a track disambiguation folded in when present
   (`.../arrow (live)`) so a distinct recording of the same track gets its own
-  location. This is the only real copy.
+  location. This is the only real copy. The disambiguation is also appended to the
+  file's **title tag** (`Aerials (live, ...)`), so a live or alternate take is
+  distinguishable in Navidrome instead of showing a bare title identical to the
+  studio recording.
 - **Libraries** -- each user has a directory `<music root>/<username>/`
   containing _symlinks_ into the pool. Navidrome scans these per-user dirs, one
   library per user (its path is `ND_MUSIC_PATH/<username>`).
@@ -97,7 +100,11 @@ Each user picks how much the bot asks before importing (via `/settings`); the
 strength comes from beets' own match recommendation:
 
 - **off** -- never ask; import the top match, or as-is when there is none.
-- **auto** (default) -- ask only when there is no strong match.
+- **auto** (default) -- ask when there is no strong match, and also when there
+  _is_ a strong match but the top candidate is not unique -- i.e. several
+  same-artist/title takes (a studio version and a live one, a radio edit, ...)
+  are all plausible. In that case the bot asks you to pick among just those
+  takes. A genuinely unique strong match imports without asking.
 - **on** -- always ask, even on a strong match.
 
 ## Commands
