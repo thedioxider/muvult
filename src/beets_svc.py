@@ -33,7 +33,7 @@ _PATH_FORMAT = "$albumartist/$album/$title%if{$trackdisambig, ($trackdisambig)}"
 _beets_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="beets")
 
 
-def setup_beets(music_root: str, search_limit: int = 8) -> None:
+def setup_beets(music_root: str, search_limit: int = 48) -> None:
     global _lib
     pool_path = str(Path(music_root) / ".pool")
     beets_config.read(user=False, defaults=True)

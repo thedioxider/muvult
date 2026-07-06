@@ -26,7 +26,7 @@ class Settings(BaseSettings):
 
     music_root: str = "/music"
     staging_root: str = "/staging"
-    mb_search_limit: int = 8
+    mb_search_limit: int = 48
 
     # Self-hosted Telegram Bot API server. Code default is the cloud API (20 MB
     # download cap): url unset, local off. Set BOT_API_URL to a local server to
