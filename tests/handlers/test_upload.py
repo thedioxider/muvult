@@ -39,6 +39,18 @@ def test_top_twins_empty():
     assert _top_twins([]) == []
 
 
+def test_top_twins_normalizes_title_punctuation():
+    # Real-world case: MusicBrainz holds "ATWA" under different punctuation
+    # across recordings ("ATWA", "A.T.W.A", "Atwa"). The live "A.T.W.A" take
+    # scored as #0 must still be recognized as a twin of the studio "ATWA".
+    cands = [
+        _c(0, "System of a Down", "A.T.W.A", "live, Le Trabendo, Paris"),
+        _c(1, "System of a Down", "ATWA"),
+        _c(2, "System of a Down", "Atwa", "live, Sportpaleis, Merksem"),
+    ]
+    assert [c.index for c in _top_twins(cands)] == [0, 1, 2]
+
+
 def _req(candidates, page=0):
     from src.models import TagResult
     return upload._ConfirmationRequest(

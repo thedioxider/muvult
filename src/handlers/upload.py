@@ -11,7 +11,7 @@ from aiogram import Bot, Router
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from sqlmodel import select
 
-from ..beets_svc import get_candidates, apply_and_stage, stage_as_is
+from ..beets_svc import get_candidates, apply_and_stage, stage_as_is, normalize_title
 from ..db import Track, TrackOwnership, User, get_session
 from ..models import ConfirmationMode, FileStatus, TagResult
 from ..pool import create_symlink, pool_rel, promote_pool_file, remove_pool_file, update_symlinks
@@ -83,15 +83,22 @@ def _top_twins(candidates: list) -> list:
 
     After dedup, two candidates sharing artist and title differ only by
     disambiguation -- distinct MB recordings of the "same" track (a live take, a
-    radio edit, ...). This returns #0 and every such twin, in list order, so a
-    single-element result means the top match is unambiguous. Each Candidate keeps
-    its original ``.index`` (its position in the full list), which the confirmation
+    radio edit, ...). Title comparison is loose (punctuation-insensitive, e.g.
+    "ATWA" == "A.T.W.A") since MusicBrainz submissions spell the same title
+    inconsistently -- a false-positive twin here just adds a harmless extra
+    choice to the prompt below, so it's safe to err on catching more. This
+    returns #0 and every such twin, in list order, so a single-element result
+    means the top match is unambiguous. Each Candidate keeps its original
+    ``.index`` (its position in the full list), which the confirmation
     callbacks resolve against.
     """
     if not candidates:
         return []
-    key = (candidates[0].artist.lower(), candidates[0].title.lower())
-    return [c for c in candidates if (c.artist.lower(), c.title.lower()) == key]
+    key = (candidates[0].artist.lower(), normalize_title(candidates[0].title, loose=True))
+    return [
+        c for c in candidates
+        if (c.artist.lower(), normalize_title(c.title, loose=True)) == key
+    ]
 
 
 @dataclass

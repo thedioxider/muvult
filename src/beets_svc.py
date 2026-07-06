@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 from asyncio import get_running_loop
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
@@ -52,6 +53,21 @@ async def get_candidates(file_path: Path) -> TagResult:
     return await loop.run_in_executor(_beets_pool, _get_candidates_sync, file_path)
 
 
+def normalize_title(title: str, loose: bool = False) -> str:
+    """Fold a title for identity comparisons.
+
+    Strict (default) just lowercases -- used for deduplication, where a
+    false-positive match would silently make a legitimate distinct candidate
+    unreachable. Loose also strips all punctuation, so titles MusicBrainz
+    submissions disagree on (``ATWA`` / ``A.T.W.A`` / ``Atwa``) compare
+    equal -- used where a false-positive match is safe, e.g. offering a human
+    a confirmation choice.
+    """
+    if not loose:
+        return title.lower()
+    return re.sub(r"[^\w]+", "", title, flags=re.UNICODE).lower()
+
+
 def _dedup_matches(matches: list) -> list:
     """Filter out recordings that are indistinguishable to the user.
 
@@ -83,7 +99,7 @@ def _dedup_matches(matches: list) -> list:
     for m in matches:
         key = (
             (m.info.artist or "").lower(),
-            (m.info.title or "").lower(),
+            normalize_title(m.info.title or ""),
             getattr(m.info, "trackdisambig", None) or "",
         )
         groups.setdefault(key, []).append(m)
