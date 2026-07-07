@@ -94,8 +94,10 @@ album, track number, disc, or year. When enabled, muvult fills these in:
   original, a later remaster, or a foreign reissue.
 - **Track and disc number** come from the specific release the recording sits on
   (a deluxe-only bonus track is numbered from the deluxe edition).
-- **Cover art** is fetched from the [Cover Art Archive](https://coverartarchive.org/)
-  and embedded in the file.
+- **Cover art** is fetched from the [Cover Art Archive](https://coverartarchive.org/):
+  a full-resolution `front` image is dropped once per album (shared across users
+  via symlink) for Navidrome to display, plus a smaller copy embedded in each file
+  as a fallback.
 
 This reuses the by-id lookup already made at import (no extra MusicBrainz request).
 Enrichment is **on by default** and can be turned off per user via `/settings`.

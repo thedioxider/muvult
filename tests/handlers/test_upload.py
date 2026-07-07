@@ -1,10 +1,19 @@
 import asyncio
+from pathlib import Path
 import pytest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 from src.handlers import upload
-from src.handlers.upload import _format_status_message, FileState, _find_existing_track, _top_twins
+from src.handlers.upload import (
+    _format_status_message,
+    FileState,
+    _find_existing_track,
+    _top_twins,
+    _album_owner_usernames,
+    _ensure_album_cover,
+)
 from src.models import Candidate, FileStatus
-from src.db import init_db, get_session, Track
+from src.db import init_db, get_session, Track, TrackOwnership, User
+from src.pool import create_symlink, find_cover
 
 
 def _c(index, artist, title, disambig=None):
@@ -215,6 +224,100 @@ async def test_find_existing_returns_none_when_neither_matches(tmp_path):
         s.add(Track(pool_path="a/b/1 - x.mp3", musicbrainz_id="rec-A", format="mp3", bitrate=320))
         await s.commit()
         assert await _find_existing_track(s, "rec-Z", "z/z.mp3") is None
+
+
+def _album_fixture(tmp_path):
+    """Two users each owning one track of Artist/Album, with real track symlinks.
+
+    Returns (music_root, pool_file, {username: album_dir}). Mirrors how upload
+    lays out the pool + per-user symlink libraries."""
+    music_root = tmp_path / "music"
+    pool_dir = music_root / ".pool" / "Artist" / "Album"
+    pool_dir.mkdir(parents=True)
+    album_dirs = {}
+    for uname, fname in (("alice", "01 - A.mp3"), ("bob", "02 - B.mp3")):
+        pool_file = pool_dir / fname
+        pool_file.write_bytes(b"audio")
+        link = create_symlink(pool_file, music_root / uname)
+        album_dirs[uname] = link.parent
+    return music_root, pool_dir, album_dirs
+
+
+async def _seed_owners(album_rel="Artist/Album"):
+    """alice+bob own one track each in the album; carol owns an unrelated one."""
+    async with get_session() as s:
+        for i, uname in enumerate(("alice", "bob", "carol"), start=1):
+            s.add(User(id=i, tg_id=i, username=uname, navidrome_user_id=str(i), navidrome_library_id=i))
+        s.add(Track(id=1, pool_path=f"{album_rel}/01 - A.mp3", format="mp3", bitrate=320))
+        s.add(Track(id=2, pool_path=f"{album_rel}/02 - B.mp3", format="mp3", bitrate=320))
+        s.add(Track(id=3, pool_path="Other/Thing/09 - z.mp3", format="mp3", bitrate=320))
+        await s.flush()  # parents before ownerships (foreign_keys=ON)
+        s.add(TrackOwnership(track_id=1, user_id=1, symlink_path="/x/alice"))
+        s.add(TrackOwnership(track_id=2, user_id=2, symlink_path="/x/bob"))
+        s.add(TrackOwnership(track_id=3, user_id=3, symlink_path="/x/carol"))
+        await s.commit()
+
+
+@pytest.mark.asyncio
+async def test_album_owner_usernames_collects_only_album_owners(tmp_path):
+    await init_db(str(tmp_path / "db"))
+    await _seed_owners()
+    async with get_session() as s:
+        names = await _album_owner_usernames(s, "Artist/Album")
+    assert set(names) == {"alice", "bob"}  # carol's unrelated album excluded
+
+
+@pytest.mark.asyncio
+async def test_ensure_album_cover_fetches_once_and_fans_out(tmp_path):
+    await init_db(str(tmp_path / "db"))
+    await _seed_owners()
+    music_root, pool_dir, album_dirs = _album_fixture(tmp_path)
+    pool_file = pool_dir / "01 - A.mp3"
+
+    fetch = AsyncMock(return_value=(b"IMGDATA", ".png"))
+    with patch("src.config.settings", MagicMock(music_root=str(music_root))), \
+         patch("src.handlers.upload.fetch_cover_art_full", fetch):
+        await _ensure_album_cover("rg-1", pool_file)
+
+    fetch.assert_awaited_once_with("rg-1")
+    pool_cover = pool_dir / "front.png"
+    assert pool_cover.read_bytes() == b"IMGDATA"
+    # every owner of the album got a symlink to the pool cover
+    for uname in ("alice", "bob"):
+        link = album_dirs[uname] / "front.png"
+        assert link.is_symlink() and link.resolve() == pool_cover.resolve()
+
+
+@pytest.mark.asyncio
+async def test_ensure_album_cover_skips_fetch_when_pool_cover_exists(tmp_path):
+    await init_db(str(tmp_path / "db"))
+    await _seed_owners()
+    music_root, pool_dir, album_dirs = _album_fixture(tmp_path)
+    pool_file = pool_dir / "01 - A.mp3"
+    (pool_dir / "front.jpg").write_bytes(b"EXISTING")  # already fetched earlier
+
+    fetch = AsyncMock()
+    with patch("src.config.settings", MagicMock(music_root=str(music_root))), \
+         patch("src.handlers.upload.fetch_cover_art_full", fetch):
+        await _ensure_album_cover("rg-1", pool_file)
+
+    fetch.assert_not_awaited()  # no refetch when a cover is already present
+    assert find_cover(album_dirs["alice"]) == album_dirs["alice"] / "front.jpg"
+
+
+@pytest.mark.asyncio
+async def test_ensure_album_cover_noop_when_fetch_fails(tmp_path):
+    await init_db(str(tmp_path / "db"))
+    await _seed_owners()
+    music_root, pool_dir, album_dirs = _album_fixture(tmp_path)
+    pool_file = pool_dir / "01 - A.mp3"
+
+    with patch("src.config.settings", MagicMock(music_root=str(music_root))), \
+         patch("src.handlers.upload.fetch_cover_art_full", AsyncMock(return_value=None)):
+        await _ensure_album_cover("rg-1", pool_file)
+
+    assert find_cover(pool_dir) is None  # nothing written
+    assert find_cover(album_dirs["alice"]) is None  # nothing linked
 
 
 @pytest.mark.asyncio

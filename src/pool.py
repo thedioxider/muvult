@@ -2,6 +2,41 @@ import os
 import shutil
 from pathlib import Path
 
+# Folder cover art (``front.<ext>``): one real image per album in the pool,
+# symlinked into each owner's album folder so Navidrome prefers it over the
+# embedded 500px art. Restricted to image suffixes so a track literally titled
+# "front" can never be mistaken for a cover during pruning.
+_COVER_STEM = "front"
+_COVER_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+
+
+def _is_cover(path: Path) -> bool:
+    return path.stem.lower() == _COVER_STEM and path.suffix.lower() in _COVER_EXTS
+
+
+def find_cover(album_dir: Path) -> Path | None:
+    """The album folder's ``front.<ext>`` cover (file or symlink), or None."""
+    try:
+        for entry in album_dir.iterdir():
+            if _is_cover(entry):
+                return entry
+    except OSError:
+        pass
+    return None
+
+
+def ensure_cover_symlink(pool_cover: Path, user_album_dir: Path) -> Path | None:
+    """Relative ``front.<ext>`` symlink in the user's album folder -> pool cover.
+
+    Idempotent: a no-op if the folder already has any ``front.*``. The album dir
+    is created if missing (it normally exists, holding the user's track links)."""
+    if find_cover(user_album_dir) is not None:
+        return None
+    user_album_dir.mkdir(parents=True, exist_ok=True)
+    link = user_album_dir / pool_cover.name
+    link.symlink_to(os.path.relpath(pool_cover, user_album_dir))
+    return link
+
 
 def _pool_root(pool_file: Path) -> Path:
     root = pool_file.parent
@@ -22,9 +57,25 @@ def create_symlink(pool_file: Path, user_dir: Path, *, flat: bool = False) -> Pa
     return link_path
 
 
+def _remove_lone_cover(directory: Path) -> None:
+    """Drop a ``front.<ext>`` cover that is a directory's only remaining entry.
+
+    A cover file/symlink would otherwise keep an album dir non-empty and block
+    pruning after its last track leaves, orphaning itself. Removing it only when
+    it is *alone* means a dir with tracks still in it keeps its cover untouched."""
+    try:
+        entries = list(directory.iterdir())
+    except OSError:
+        return
+    if entries and all(_is_cover(e) for e in entries):
+        for e in entries:
+            e.unlink()
+
+
 def _cleanup_empty_parents(path: Path, stop_at: Path | None = None) -> None:
     parent = path.parent
     while stop_at is None or parent != stop_at:
+        _remove_lone_cover(parent)
         try:
             parent.rmdir()
         except OSError:

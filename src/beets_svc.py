@@ -438,6 +438,46 @@ def _fetch_cover_art(rgid: str) -> bytes | None:
         return None
 
 
+def _image_ext(data: bytes) -> str:
+    """Filename extension for image bytes by magic number; defaults to ``.jpg``."""
+    if data[:3] == b"\xff\xd8\xff":
+        return ".jpg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return ".gif"
+    return ".jpg"
+
+
+@lru_cache(maxsize=256)
+def _fetch_cover_art_full(rgid: str) -> tuple[bytes, str] | None:
+    """Full-resolution release-group front cover from the CAA, as ``(bytes, ext)``.
+
+    Unlike ``_fetch_cover_art`` (the 500px rendition used for embedding), this
+    pulls the original scan (``/front``), whose format varies -- hence the
+    detected extension. Cached by release-group id so a bulk album fetches once;
+    best-effort (any failure returns None)."""
+    url = f"https://coverartarchive.org/release-group/{rgid}/front"
+    try:
+        with urlopen(Request(url, headers={"User-Agent": _CAA_USER_AGENT}), timeout=30) as resp:
+            data = resp.read()
+    except Exception:
+        log.debug("full cover art fetch failed for release-group %s", rgid)
+        return None
+    if not data:
+        return None
+    return data, _image_ext(data)
+
+
+async def fetch_cover_art_full(rgid: str) -> tuple[bytes, str] | None:
+    """Async wrapper for ``_fetch_cover_art_full`` (plain network, not a beets
+    call -- runs on the default executor, not ``_beets_pool``)."""
+    loop = get_running_loop()
+    return await loop.run_in_executor(None, _fetch_cover_art_full, rgid)
+
+
 def _embed_cover_art(file_path: Path, rgid: str) -> None:
     """Embed the release group's front cover into the file, best-effort."""
     data = _fetch_cover_art(rgid)

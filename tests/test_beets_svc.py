@@ -8,6 +8,8 @@ from src.beets_svc import (
     _get_candidates_sync,
     _apply_and_stage_sync,
     _stage_as_is_sync,
+    _fetch_cover_art_full,
+    _image_ext,
     _nearest_release_length,
     _album_fields,
     _format_artist_credit,
@@ -15,6 +17,37 @@ from src.beets_svc import (
     _year_of,
     select_release,
 )
+
+
+_JPEG = b"\xff\xd8\xff\xe0\x00\x10JFIF" + b"\x00" * 32
+_PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+_WEBP = b"RIFF\x00\x00\x00\x00WEBPVP8 " + b"\x00" * 16
+_GIF = b"GIF89a" + b"\x00" * 32
+
+
+def test_image_ext_by_magic_number():
+    assert _image_ext(_JPEG) == ".jpg"
+    assert _image_ext(_PNG) == ".png"
+    assert _image_ext(_WEBP) == ".webp"
+    assert _image_ext(_GIF) == ".gif"
+    assert _image_ext(b"garbage") == ".jpg"  # unknown -> jpg
+
+
+def test_fetch_cover_art_full_returns_bytes_and_ext():
+    with patch("src.beets_svc.urlopen") as m:
+        m.return_value.__enter__.return_value.read.return_value = _PNG
+        assert _fetch_cover_art_full("rg-png") == (_PNG, ".png")
+
+
+def test_fetch_cover_art_full_swallows_errors():
+    with patch("src.beets_svc.urlopen", side_effect=Exception("boom")):
+        assert _fetch_cover_art_full("rg-fail") is None
+
+
+def test_fetch_cover_art_full_none_on_empty_body():
+    with patch("src.beets_svc.urlopen") as m:
+        m.return_value.__enter__.return_value.read.return_value = b""
+        assert _fetch_cover_art_full("rg-empty") is None
 
 
 def _rel(rid, title, primary, secondary, status, date, country, artist="half•alive"):
