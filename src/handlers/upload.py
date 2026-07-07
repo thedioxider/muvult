@@ -12,6 +12,8 @@ from aiogram import Bot, Router
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from sqlmodel import select
 
+from beets.autotag.match import Recommendation
+
 from ..beets_svc import get_candidates, apply_and_stage, stage_as_is, normalize_title
 from ..db import Track, TrackOwnership, User, get_session
 from ..models import ConfirmationMode, FileStatus, TagResult
@@ -373,7 +375,7 @@ async def _ask_confirmation(bot: Bot, tg_id: int, req: "_ConfirmationRequest") -
             InlineKeyboardButton(text="Skip", callback_data=f"conf{_CB_SEP}skip"),
         ]]
         text = f"❌ No matches found for:\n<i>{fname}</i>"
-    elif tag.recommendation >= 3:
+    elif tag.recommendation >= Recommendation.strong:
         c = tag.candidates[0]
         artist = html.escape(c.artist)
         title = html.escape(c.title)
@@ -422,10 +424,17 @@ async def _process_file(
         states[file_id] = FileState(filename, FileStatus.DOWNLOADING)
         await report()
         await bot.download(file_id, destination=file_path)
+        log.info("received %r (tg_id=%s, %d bytes)", filename, tg_id, file_path.stat().st_size)
 
         states[file_id].status = FileStatus.TAGGING
         await report()
         tag_result = await get_candidates(file_path)
+        log.info(
+            "tagged %r: %s, %d candidate(s)", filename,
+            "fingerprint" if tag_result.fingerprinted
+            else "search" if tag_result.candidates else "no match",
+            len(tag_result.candidates),
+        )
 
         async with get_session() as session:
             result = await session.exec(select(User).where(User.tg_id == tg_id))
@@ -434,25 +443,31 @@ async def _process_file(
         mode = ConfirmationMode(user_settings.get("confirmation", "auto"))
         enrich = user_settings.get("enrich", True)
 
-        is_high = tag_result.recommendation >= 3
+        is_high = tag_result.recommendation >= Recommendation.strong
         chosen_index: int | str | None = None
 
         if mode == ConfirmationMode.OFF:
             chosen_index = 0 if (is_high and tag_result.candidates) else "asis"
         elif mode == ConfirmationMode.AUTO and is_high and tag_result.candidates:
-            twins = _top_twins(tag_result.candidates)
-            if len(twins) == 1:
+            # On the fingerprint path the whole candidate set already *is* the
+            # ambiguity (every entry is an audio match), so any leftover after
+            # dedup means "prompt". On the text path we instead reconstruct which
+            # recordings hide behind the top pick via same-artist+title twins.
+            group = (
+                tag_result.candidates
+                if tag_result.fingerprinted
+                else _top_twins(tag_result.candidates)
+            )
+            if len(group) == 1:
                 chosen_index = 0  # unique high-confidence match: import without asking
             else:
-                # High confidence, but candidate #0 has same-artist+title twins that
-                # dedup kept apart by disambiguation (a live take, a radio edit, ...).
-                # We can't tell which the user meant, so prompt -- but only among the
-                # twins, not the whole list. The buttons carry each candidate's
-                # original .index (its position in the full list), so the int result
-                # still resolves against tag_result.candidates below.
+                # Ambiguous: prompt, but only among this group, not the whole list.
+                # The buttons carry each candidate's original .index (its position
+                # in the full list), so the int result still resolves against
+                # tag_result.candidates below.
                 chosen_index = await _queue_confirmation(
                     bot, tg_id, file_id, filename,
-                    TagResult(candidates=twins, recommendation=0),
+                    TagResult(candidates=group, recommendation=Recommendation.none),
                     file_path, states, report,
                 )
         else:
@@ -460,10 +475,11 @@ async def _process_file(
                 chosen_index = await _queue_confirmation(bot, tg_id, file_id, filename, tag_result, file_path, states, report)
                 if chosen_index != "list":
                     break
-                tag_result.recommendation = 0
+                tag_result.recommendation = Recommendation.none
 
         if chosen_index is None:
             states[file_id] = FileState(filename, FileStatus.SKIPPED)
+            log.info("skipped %r (tg_id=%s): no selection", filename, tg_id)
             await report()
             return
 
@@ -552,8 +568,13 @@ async def _process_file(
 
         if already_owned:
             states[file_id] = FileState(filename, FileStatus.DUPLICATE)
+            log.info("duplicate %r (user=%s): already owns %s",
+                     filename, db_user.username, pool_rel(pool_file))
         else:
             states[file_id] = FileState(filename, FileStatus.IMPORTED, note)
+            action = "as-is" if is_asis else "upgraded" if note else "imported"
+            log.info("%s %r (user=%s) -> %s",
+                     action, filename, db_user.username, pool_rel(pool_file))
         await report()
 
     except Exception as e:

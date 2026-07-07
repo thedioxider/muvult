@@ -12,9 +12,9 @@ upgraded in place and everyone's library follows.
 
 ## How it works
 
-A file uploaded over Telegram is downloaded to a staging area, identified via
-MusicBrainz (through beets), then filed into a shared pool and linked into the
-uploader's library:
+A file uploaded over Telegram is downloaded to a staging area, identified by
+audio fingerprint (with a MusicBrainz text search as fallback, through beets),
+then filed into a shared pool and linked into the uploader's library:
 
 - **Pool** -- `<music root>/.pool/` holds exactly one file per track, named
   `$albumartist/$album/$title`, with a track disambiguation folded in when present
@@ -40,21 +40,30 @@ uploader's library:
 
 ## Tagging
 
-muvult drives [beets](https://beets.io/) for MusicBrainz lookup. beets' stock
-MusicBrainz recording search misidentifies unicode artists and fails on titles
-carrying extra tokens like `(Album Version)`. muvult patches the search into a
-more robust shape (`+artist:(…) +(recording:(…) alias:(…)) release:(…)`) --
+muvult drives [beets](https://beets.io/) for identification, using two candidate
+sources: an audio fingerprint (primary) and a MusicBrainz text search (fallback).
+
+### Fingerprint first, text search as fallback
+
+Every upload is first fingerprinted with [AcoustID](https://acoustid.org/), which
+identifies the actual recording from the audio itself, independent of the file's
+existing tags. A fingerprint match is authoritative: when it hits, the candidates
+are *only* those recordings. The text search below is used only when the
+fingerprint finds nothing (an unknown or obscure track, or no network).
+
+### Text search: one search, no per-candidate lookups
+
+beets' stock MusicBrainz recording search misidentifies unicode artists and fails
+on titles carrying extra tokens like `(Album Version)`. muvult patches the search
+into a more robust shape (`+artist:(…) +(recording:(…) alias:(…)) release:(…)`) --
 required identity fields, forgiving on description, album as an optional boost.
 
-### One search, no per-candidate lookups
-
-Candidates come from a **single** MusicBrainz recording search. That one response
-already carries everything matching and the picker need -- title, artist, ISRC,
-disambiguation, and every release the recording sits on with its per-release track
-length -- so muvult builds the candidates straight from it, skipping the extra
-per-candidate lookup beets would otherwise make (the dominant cost at 1 request/s).
-The full, authoritative metadata for the track you actually import is fetched once,
-by id, at import time.
+Those candidates come from a **single** MusicBrainz recording search. That one
+response already carries everything matching and the picker need -- title, artist,
+ISRC, disambiguation, and every release the recording sits on with its per-release
+track length -- so muvult builds the candidates straight from it, skipping the
+extra per-candidate lookup beets would otherwise make. The full, authoritative
+metadata for the track you actually import is fetched once, by id, at import time.
 
 A recording's own stored length can differ from the length of the *track* on the
 release your file came from. Before scoring, muvult corrects each candidate's
@@ -75,24 +84,21 @@ beets match (lowest corrected distance, i.e. closest length), then lowest record
 id so the choice is deterministic across uploads. This applies to every match,
 including strong ones, so even auto-imports pick the canonical recording.
 
-### Release enrichment
+### Album enrichment
 
-A MusicBrainz recording carries only track-level metadata (title, artist) -- it
-is not tied to any release, so it has no album, track number, disc, or year. When
-enabled, muvult resolves the imported recording to a specific release and pulls
-full album metadata from there. The release is picked, in order, by: official
-status; a primary artist matching the track's (over "Various Artists"
-compilations); a studio album (no secondary types, with album over EP over
-single); a worldwide release; then the release whose track length is closest to
-the file (in milliseconds, against the file's own duration); earliest date; then
-lowest release id. The year comes from the recording's earliest official release.
-If any of this fails the track still imports, with recording-level tags only.
+A MusicBrainz recording carries only track-level metadata (title, artist) -- no
+album, track number, disc, or year. When enabled, muvult fills these in:
 
-Enrichment reuses the releases from the import lookup (no extra request) and
-caches release lookups by id, so a whole album uploaded at once resolves its
-shared release just once. It is **on by default** and can be turned off per user
-via `/settings` -- with it off, tracks are tagged with title and artist only (any
-album/track tags already on the file are kept) and import faster.
+- **Album, artist, year** come from the recording's *release group*, not any one
+  pressing -- so a track's album stays the same whether it was matched against the
+  original, a later remaster, or a foreign reissue.
+- **Track and disc number** come from the specific release the recording sits on
+  (a deluxe-only bonus track is numbered from the deluxe edition).
+- **Cover art** is fetched from the [Cover Art Archive](https://coverartarchive.org/)
+  and embedded in the file.
+
+This reuses the by-id lookup already made at import (no extra MusicBrainz request).
+Enrichment is **on by default** and can be turned off per user via `/settings`.
 
 ### Confirmation modes
 
@@ -100,11 +106,12 @@ Each user picks how much the bot asks before importing (via `/settings`); the
 strength comes from beets' own match recommendation:
 
 - **off** -- never ask; import the top match, or as-is when there is none.
-- **auto** (default) -- ask when there is no strong match, and also when there
-  _is_ a strong match but the top candidate is not unique -- i.e. several
-  same-artist/title takes (a studio version and a live one, a radio edit, ...)
-  are all plausible. In that case the bot asks you to pick among just those
-  takes. A genuinely unique strong match imports without asking.
+- **auto** (default) -- ask when there is no strong match, and also when the
+  match is ambiguous. For a fingerprint match, "ambiguous" means the fingerprint
+  resolved to more than one distinct recording; for a text-search match, it means
+  the top candidate has same-artist/title siblings (a studio version and a live
+  one, a radio edit, ...). In either case the bot asks you to pick among just
+  those; a genuinely unique match imports without asking.
 - **on** -- always ask, even on a strong match.
 
 ## Commands

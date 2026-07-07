@@ -6,9 +6,10 @@ from asyncio import get_running_loop
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from pathlib import Path
+from urllib.request import Request, urlopen
 
 from beets import config as beets_config, plugins
-from beets.autotag.match import tag_item
+from beets.autotag.match import Recommendation, tag_item
 from beets.library import Library
 from beets.library.models import Item
 
@@ -37,8 +38,15 @@ def setup_beets(music_root: str, search_limit: int = 48) -> None:
     global _lib
     pool_path = str(Path(music_root) / ".pool")
     beets_config.read(user=False, defaults=True)
-    beets_config["plugins"].set(["musicbrainz"])
+    # chroma (AcoustID fingerprinting) sits alongside musicbrainz as a second
+    # candidate source: it resolves the *actual* recording from the audio,
+    # independent of how well the file's existing tags text-search. `auto` off
+    # because we drive the fingerprint lookup ourselves (see _fingerprint_item) --
+    # the import-pipeline listener it would otherwise register never fires under
+    # our direct tag_item() calls.
+    beets_config["plugins"].set(["musicbrainz", "chroma"])
     beets_config["musicbrainz"]["search_limit"].set(search_limit)
+    beets_config["chroma"]["auto"].set(False)
     plugins.load_plugins()
     from .beets_patches import patch_mb_search
     patch_mb_search()
@@ -141,11 +149,47 @@ def _nearest_release_length(rec: dict, file_length_s: float | None) -> float | N
     return best / 1000.0 if best is not None else None
 
 
+def _fingerprint_item(item: Item) -> set[str]:
+    """AcoustID recording ids for this file's audio, or an empty set.
+
+    Runs the chroma fingerprint lookup ourselves (muvult never enters beets'
+    import pipeline, where chroma would otherwise trigger it) so that chroma's
+    ``item_candidates`` fires inside the following ``tag_item`` -- and so we know
+    which candidates are fingerprint-backed. Fully guarded: a missing ``fpcalc``
+    binary, a network failure, or no match all degrade to search-only tagging.
+    """
+    try:
+        from beetsplug import chroma
+
+        chroma.acoustid_match(log, item.path)
+        match = chroma._matches.get(item.path)
+        return set(match[0]) if match else set()
+    except Exception:
+        log.exception("acoustid fingerprint lookup failed")
+        return set()
+
+
 def _get_candidates_sync(file_path: Path) -> TagResult:
     item = Item.from_path(str(file_path))
+    fp_ids = _fingerprint_item(item)
     proposal = tag_item(item)
+    # A fingerprint match is the authoritative audio identity: when present, the
+    # candidate set is *only* the fingerprinted recordings (deduped as usual),
+    # and text-search hits are discarded. Text search is the fallback used solely
+    # when the fingerprint found nothing (unknown/obscure track).
+    fp_matches = [m for m in proposal.candidates if m.info.track_id in fp_ids]
+    if fp_matches:
+        matches = _dedup_matches(fp_matches)
+        fingerprinted = True
+        # A fingerprint hit is the authoritative audio identity, so it enters the
+        # confirmation gate as strong regardless of how the stale tags text-scored.
+        recommendation = Recommendation.strong
+    else:
+        matches = _dedup_matches(proposal.candidates)
+        fingerprinted = False
+        recommendation = proposal.recommendation
     candidates = []
-    for i, match in enumerate(_dedup_matches(proposal.candidates)):
+    for i, match in enumerate(matches):
         info = match.info
         candidates.append(
             Candidate(
@@ -161,7 +205,11 @@ def _get_candidates_sync(file_path: Path) -> TagResult:
                 disambig=getattr(info, "trackdisambig", None),
             )
         )
-    return TagResult(candidates=candidates, recommendation=int(proposal.recommendation))
+    return TagResult(
+        candidates=candidates,
+        recommendation=recommendation,
+        fingerprinted=fingerprinted,
+    )
 
 
 async def apply_and_stage(
@@ -244,19 +292,6 @@ def select_release(
     return min(releases, key=key)
 
 
-def earliest_official_year(releases: list[dict]) -> int | None:
-    """Year of the earliest Official release of the recording (any release if none)."""
-    dates = [r["date"] for r in releases if r.get("status") == "Official" and r.get("date")]
-    if not dates:
-        dates = [r["date"] for r in releases if r.get("date")]
-    if not dates:
-        return None
-    try:
-        return int(min(dates)[:4])
-    except ValueError:
-        return None
-
-
 def _mb_plugin():
     from beets import metadata_plugins
 
@@ -285,21 +320,154 @@ def _get_recording_full(rec_id: str) -> dict | None:
         return None
 
 
-@lru_cache(maxsize=256)
-def _album_for_id_cached(release_id: str):
-    """Cache release lookups by id: a bulk album upload hits each release once.
+# MusicBrainz' special-purpose artist for various-artists compilations.
+_VARIOUS_ARTISTS_ID = "89ad4ac3-39f7-470e-963a-56509c546377"
 
-    ``merge_with_album`` reads the AlbumInfo and returns a fresh dict without
-    mutating it, so sharing the cached object across tracks is safe.
+
+def _format_artist_credit(credit: list | None) -> tuple[str, list[str]]:
+    """Flatten an MB artist-credit into (display name, [artist ids]).
+
+    Joins each credited part with its ``joinphrase`` so features/collabs read as
+    MB wrote them ("Alice feat. Bob"); ids keep source order.
     """
-    plugin = _mb_plugin()
-    if plugin is None:
+    parts = credit or []
+    name = "".join(
+        (p.get("name") or (p.get("artist") or {}).get("name") or "")
+        + (p.get("joinphrase") or "")
+        for p in parts
+    ).strip()
+    ids = [aid for p in parts if (aid := (p.get("artist") or {}).get("id"))]
+    return name, ids
+
+
+def _year_of(date: str | None) -> int | None:
+    if not date:
         return None
     try:
-        return plugin.album_for_id(release_id)
-    except Exception:
-        log.exception("album_for_id failed for %s", release_id)
+        return int(str(date)[:4])
+    except ValueError:
         return None
+
+
+def _track_numbering(release: dict) -> dict:
+    """Track/disc position of the recording on this release.
+
+    The recording lookup embeds only the matching recording's own track(s) under
+    each release's media, so the first track of the first non-empty medium *is*
+    this recording's entry -- no rec-id match needed. A non-numeric track number
+    (vinyl "A1") is skipped rather than coerced. Disc total is not derivable (only
+    the medium carrying the track is present), so it is omitted.
+    """
+    for medium in release.get("media") or []:
+        tracks = medium.get("tracks") or medium.get("track") or []
+        if not tracks:
+            continue
+        out: dict = {}
+        num = tracks[0].get("number") or tracks[0].get("position")
+        try:
+            out["track"] = int(str(num))
+        except (TypeError, ValueError):
+            pass
+        if medium.get("position") is not None:
+            out["disc"] = medium["position"]
+        if medium.get("track_count") is not None:
+            out["tracktotal"] = medium["track_count"]
+        return out
+    return {}
+
+
+def _album_fields(chosen: dict) -> dict | None:
+    """Album-level tags for a singleton: identity from the release *group*,
+    numbering from the chosen release.
+
+    Album identity -- name, artist, year, type, group id -- is read from the
+    release group, never the specific release. Every pressing and remaster of an
+    album shares one group, so this is invariant to which physical release
+    ``select_release`` happened to pick; the pressing roulette that used to decide
+    the album *title* (a Japanese pressing, a 2016 remaster, a "printed in
+    England" edition) can no longer touch it. Only the per-track numbering is
+    release-specific, and it can only come from a release the recording is on.
+
+    Deliberately omits every pressing-specific field -- ``mb_albumid``,
+    ``albumdisambig``, ``catalognum``, ``barcode``, ``country``, ``label``,
+    ``script``, ... A per-track-varying ``mb_albumid`` in particular fragments the
+    album in players that key on it (Navidrome's default album PID is
+    ``musicbrainz_albumid|...``); dropping it makes them fall back to the
+    group-level ``(albumartistid, album, releasedate)`` we set identically on
+    every track. Returns ``None`` when there's no usable release group.
+    """
+    rg = chosen.get("release_group") or {}
+    if not rg.get("id"):
+        return None
+    data: dict = {"mb_releasegroupid": rg["id"]}
+    if title := rg.get("title"):
+        data["album"] = title
+    name, ids = _format_artist_credit(rg.get("artist_credit") or chosen.get("artist_credit"))
+    if name:
+        data["albumartist"] = name
+    if ids:
+        data["mb_albumartistid"] = ids[0]
+        data["comp"] = 1 if _VARIOUS_ARTISTS_ID in ids else 0
+    if (year := _year_of(rg.get("first_release_date"))) is not None:
+        data["year"] = year
+    if primary := rg.get("primary_type"):
+        data["albumtype"] = primary.lower()
+        data["albumtypes"] = [t.lower() for t in [primary, *(rg.get("secondary_types") or [])]]
+    data.update(_track_numbering(chosen))
+    return data
+
+
+# Cover Art Archive requires a descriptive User-Agent; it 404s (not errors) when a
+# release group has no front image, which the guarded fetch treats as "no art".
+_CAA_USER_AGENT = "muvult/1.1 (https://github.com/thedioxider)"
+
+
+@lru_cache(maxsize=256)
+def _fetch_cover_art(rgid: str) -> bytes | None:
+    """Release-group front cover bytes from the Cover Art Archive, or None.
+
+    Cached by release-group id so a bulk album upload fetches the shared cover
+    once. Best-effort: any failure (no art, network, timeout) returns None.
+    """
+    url = f"https://coverartarchive.org/release-group/{rgid}/front-500"
+    try:
+        with urlopen(Request(url, headers={"User-Agent": _CAA_USER_AGENT}), timeout=15) as resp:
+            return resp.read()
+    except Exception:
+        log.debug("cover art fetch failed for release-group %s", rgid)
+        return None
+
+
+def _embed_cover_art(file_path: Path, rgid: str) -> None:
+    """Embed the release group's front cover into the file, best-effort."""
+    data = _fetch_cover_art(rgid)
+    if not data:
+        return
+    try:
+        from mediafile import Image, ImageType, MediaFile
+
+        mf = MediaFile(str(file_path))
+        mf.images = [Image(data=data, type=ImageType.front)]
+        mf.save()
+    except Exception:
+        log.debug("cover art embed failed for %s", file_path)
+
+
+def _tag_acoustid(item: Item) -> None:
+    """Stamp the file with its AcoustID id, if we fingerprinted it.
+
+    The id identifies the audio itself, so it's written whenever the fingerprint
+    lookup produced one -- independent of which candidate won -- making "was this
+    fingerprinted?" answerable from the file's ``ACOUSTID_ID`` tag alone. chroma's
+    ``_acoustids`` was populated by ``_fingerprint_item`` for this same path.
+    """
+    try:
+        from beetsplug import chroma
+
+        if aid := chroma._acoustids.get(item.path):
+            item.acoustid_id = aid
+    except Exception:
+        pass
 
 
 def _enrich_from_release(
@@ -308,31 +476,21 @@ def _enrich_from_release(
     track_artist: str | None,
     file_length_s: float | None,
 ) -> dict | None:
-    """Resolve a recording's releases to one release and return album-level data.
+    """Pick the release the file most likely came from and derive album-level tags.
 
-    Given the releases from the import lookup, pick one (see ``select_release``,
-    length-aware), pull full album metadata via beets' own ``album_for_id`` +
-    ``merge_with_album`` (cached), and override the year with the recording's
-    earliest official release. Returns ``None`` on any failure so the caller keeps
-    the plain recording-level tags. Runs on ``_beets_pool``.
+    ``select_release`` (length-aware) chooses the numbering release -- among the
+    releases the recording actually appears on, so a deluxe-only bonus track is
+    numbered from the deluxe edition it lives on. ``_album_fields`` then reads
+    album identity from that release's *group* and the track number from the
+    release itself. Returns ``None`` on any failure so the caller keeps the plain
+    recording-level tags. Runs on ``_beets_pool``.
     """
     try:
         file_length_ms = int(file_length_s * 1000) if file_length_s else None
         chosen = select_release(releases, track_artist, file_length_ms)
         if chosen is None:
             return None
-        album_info = _album_for_id_cached(chosen["id"])
-        if album_info is None:
-            return None
-        album_track = next(
-            (t for t in album_info.tracks if t.track_id == rec_id), None
-        )
-        if album_track is None:
-            return None
-        data = album_track.merge_with_album(album_info)
-        if (year := earliest_official_year(releases)) is not None:
-            data["year"] = year
-        return data
+        return _album_fields(chosen)
     except Exception:
         log.exception("release enrichment failed for recording %s", rec_id)
         return None
@@ -367,6 +525,7 @@ def _apply_and_stage_sync(
         item.update(info.item_data)
         track_artist = info.artist
         releases = []
+    enriched = None
     if enrich and releases:
         enriched = _enrich_from_release(
             releases, candidate.mb_track_id, track_artist, file_length
@@ -386,7 +545,12 @@ def _apply_and_stage_sync(
     # title is reset to the clean recording title by item.update before we append.
     if disambig := (item.trackdisambig or "").strip():
         item.title = f"{item.title} ({disambig})"
+    _tag_acoustid(item)
     item.write(path=str(file_path))
+    # Cover art rides on album identity: embed the release group's front image so a
+    # symlinked pool (no per-album folder to drop a cover in) still shows art.
+    if enriched and (rgid := enriched.get("mb_releasegroupid")):
+        _embed_cover_art(file_path, rgid)
     return file_path, dest
 
 
