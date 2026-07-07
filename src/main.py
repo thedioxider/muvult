@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.INFO)
 
 async def main() -> None:
     await init_db()
-    setup_beets(settings.music_root, settings.mb_search_limit)
+    setup_beets(settings.music_root, settings.mb_search_limit, settings.acoustid_api_key)
 
     session = None
     if settings.bot_api_url:

@@ -184,3 +184,95 @@ def test_item_candidates_builds_from_search_without_lookups():
     plugin.mb_api.get_recording.assert_not_called()
     assert len(result) == 1
     assert result[0].length == pytest.approx(222.706)  # corrected off recording length
+
+
+# --- AcoustID lookup retry -------------------------------------------------
+#
+# The library makes a single un-retried POST, so one network blip or a
+# rate-limit `status: error` response silently drops a fingerprint match to
+# text-search-only. These exercise the retry wrapper directly.
+
+
+@pytest.fixture(autouse=True)
+def _no_sleep(monkeypatch):
+    monkeypatch.setattr("src.beets_patches.time.sleep", lambda *_: None)
+
+
+def test_acoustid_retry_returns_ok_on_first_call():
+    from src.beets_patches import _acoustid_lookup_with_retry
+
+    fn = MagicMock(return_value={"status": "ok", "results": []})
+    res = _acoustid_lookup_with_retry(fn, "key", "fp", 100)
+    assert res["status"] == "ok"
+    assert fn.call_count == 1  # a genuine no-match is not retried
+
+
+def test_acoustid_retry_recovers_from_web_service_error():
+    import acoustid
+
+    from src.beets_patches import _acoustid_lookup_with_retry
+
+    fn = MagicMock(side_effect=[acoustid.WebServiceError("boom"), {"status": "ok"}])
+    res = _acoustid_lookup_with_retry(fn, "k", "fp", 1)
+    assert res == {"status": "ok"}
+    assert fn.call_count == 2
+
+
+def test_acoustid_retry_recovers_from_transient_error_status():
+    from src.beets_patches import _acoustid_lookup_with_retry
+
+    # A non-permanent error (e.g. rate limit / server error) is retried.
+    fn = MagicMock(
+        side_effect=[
+            {"status": "error", "error": {"message": "rate limit exceeded"}},
+            {"status": "ok", "results": [1]},
+        ]
+    )
+    res = _acoustid_lookup_with_retry(fn, "k", "fp", 1)
+    assert res["status"] == "ok"
+    assert fn.call_count == 2
+
+
+def test_acoustid_retry_does_not_retry_permanent_error():
+    from src.beets_patches import _acoustid_lookup_with_retry
+
+    # A bad key fails identically every time -- return at once, don't burn retries.
+    fn = MagicMock(
+        return_value={"status": "error", "error": {"code": 4, "message": "invalid API key"}}
+    )
+    res = _acoustid_lookup_with_retry(fn, "k", "fp", 1)
+    assert res["status"] == "error"
+    assert fn.call_count == 1
+
+
+def test_acoustid_retry_reraises_after_exhaustion():
+    import acoustid
+
+    from src.beets_patches import _ACOUSTID_RETRIES, _acoustid_lookup_with_retry
+
+    fn = MagicMock(side_effect=acoustid.WebServiceError("down"))
+    with pytest.raises(acoustid.WebServiceError):
+        _acoustid_lookup_with_retry(fn, "k", "fp", 1)
+    assert fn.call_count == _ACOUSTID_RETRIES
+
+
+def test_acoustid_retry_returns_error_status_after_exhaustion():
+    from src.beets_patches import _ACOUSTID_RETRIES, _acoustid_lookup_with_retry
+
+    fn = MagicMock(return_value={"status": "error", "error": {"message": "rate limit"}})
+    res = _acoustid_lookup_with_retry(fn, "k", "fp", 1)
+    # returned (not raised) so chroma treats it as no-match, as before
+    assert res["status"] == "error"
+    assert fn.call_count == _ACOUSTID_RETRIES
+
+
+def test_patch_acoustid_lookup_is_idempotent():
+    import acoustid
+
+    from src.beets_patches import patch_acoustid_lookup
+
+    patch_acoustid_lookup()
+    first = acoustid.lookup
+    assert getattr(acoustid.lookup, "_muvult_retry", False) is True
+    patch_acoustid_lookup()
+    assert acoustid.lookup is first  # not double-wrapped

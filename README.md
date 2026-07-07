@@ -151,6 +151,7 @@ Configuration is read from the environment (see `.env.example`):
 | `MUSIC_ROOT`    | Library root inside the container (default `/music`)         |
 | `STAGING_ROOT`  | Temp download area inside the container (default `/staging`) |
 | `MB_SEARCH_LIMIT` | MusicBrainz search results fetched per lookup (default 48) |
+| `ACOUSTID_API_KEY` | Own AcoustID key for fingerprint lookups (free at acoustid.org). Empty -> chroma's shared, rate-limited key |
 | `TG_API_ID` / `TG_API_HASH` | Telegram app credentials (https://my.telegram.org) for the self-hosted Bot API server |
 | `BOT_API_URL`   | Self-hosted Bot API server URL. Empty -> cloud API (20 MB cap) |
 | `BOT_API_LOCAL` | `1` if that server runs with `--local` (files read off the shared volume) |

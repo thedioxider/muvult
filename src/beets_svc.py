@@ -34,7 +34,9 @@ _PATH_FORMAT = "$albumartist/$album/$title%if{$trackdisambig, ($trackdisambig)}"
 _beets_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="beets")
 
 
-def setup_beets(music_root: str, search_limit: int = 48) -> None:
+def setup_beets(
+    music_root: str, search_limit: int = 48, acoustid_api_key: str | None = None
+) -> None:
     global _lib
     pool_path = str(Path(music_root) / ".pool")
     beets_config.read(user=False, defaults=True)
@@ -48,8 +50,17 @@ def setup_beets(music_root: str, search_limit: int = 48) -> None:
     beets_config["musicbrainz"]["search_limit"].set(search_limit)
     beets_config["chroma"]["auto"].set(False)
     plugins.load_plugins()
-    from .beets_patches import patch_mb_search
+    from .beets_patches import patch_acoustid_lookup, patch_mb_search
     patch_mb_search()
+    patch_acoustid_lookup()
+    # chroma resolves recordings with a hardcoded, globally-shared AcoustID app
+    # key that gets rate-limited (returning a "status: error" chroma treats as
+    # "no match" -- a silent fingerprint miss). Our own key gives a private
+    # 3 req/s budget. The key is only used for lookups via the module constant;
+    # beets' `acoustid.apikey` config is submission-only, which we don't do.
+    if acoustid_api_key:
+        import beetsplug.chroma as chroma
+        chroma.API_KEY = acoustid_api_key
     beets_config["asciify_paths"].set(True)
     beets_config["paths"]["default"].set(_PATH_FORMAT)
     beets_config["paths"]["singleton"].set(_PATH_FORMAT)

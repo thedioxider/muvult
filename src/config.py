@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     staging_root: str = "/staging"
     mb_search_limit: int = 48
 
+    # Own AcoustID app key for fingerprint lookups. Unset -> chroma's built-in
+    # globally-shared key (works, but rate-limited under contention). Register a
+    # free key at https://acoustid.org/ to get a private budget.
+    acoustid_api_key: str | None = None
+
     # Self-hosted Telegram Bot API server. Code default is the cloud API (20 MB
     # download cap): url unset, local off. Set BOT_API_URL to a local server to
     # lift the cap to 2000 MB, and BOT_API_LOCAL=1 if it runs with --local.

@@ -26,11 +26,105 @@
 #   (singles, compilations, deluxe editions).
 
 
+import logging
+import time
+
+log = logging.getLogger(__name__)
+
+# Rate limits are handled prevention-first. AcoustID's client already throttles
+# proactively (its `@_rate_limit` monitor enforces 3 req/s) and our own key gives
+# a private budget instead of sharing the globally-contended default one, so we
+# shouldn't trip the limit at all. This retry is only the residual safety net:
+# AcoustID's client makes a single un-retried POST (the MusicBrainz path has 5
+# urllib3 retries), so one network blip or a transient `status: error` response
+# -- which chroma silently treats as "no match" -- drops a fingerprintable track
+# to text-search-only. Backoff is exponential so that if a rate-limit response
+# does slip through, each retry gives the endpoint progressively more room
+# instead of hammering it at a fixed cadence.
+_ACOUSTID_RETRIES = 3
+_ACOUSTID_BACKOFF = 0.5  # seconds; doubled each attempt (0.5s, 1.0s, ...)
+
+# A permanent client error fails identically on every retry, so we return it
+# immediately (loudly) instead of masking a misconfiguration as flakiness that
+# silently degrades every upload to text-search. Matched on the error message so
+# it survives AcoustID renumbering its error codes.
+_ACOUSTID_PERMANENT_ERRORS = ("api key", "invalid fingerprint", "invalid uuid")
+
+
 def patch_mb_search() -> None:
     """Apply the recording-search reshaping patches (idempotent)."""
     _patch_search_query()
     _patch_recording_criteria()
     _patch_item_candidates()
+
+
+def _is_permanent_acoustid_error(res: dict) -> bool:
+    """A ``status: error`` response that will fail identically on every retry."""
+    message = ((res.get("error") or {}).get("message") or "").lower()
+    return any(s in message for s in _ACOUSTID_PERMANENT_ERRORS)
+
+
+def _acoustid_lookup_with_retry(fn, *args, **kwargs):
+    """Call AcoustID lookup ``fn``, retrying only genuinely transient failures.
+
+    Retries a raised ``WebServiceError`` (network blip / timeout) and a transient
+    ``status != "ok"`` response (rate limit, server error). Returns immediately
+    on a genuine no-match (``status "ok"``, empty results) and on a permanent
+    client error (bad key / fingerprint, ``_is_permanent_acoustid_error``) -- the
+    latter logged at ERROR so a misconfigured key surfaces instead of silently
+    degrading every upload to text-search. On exhaustion the original contract is
+    preserved: re-raise the last exception, or return the last error response for
+    chroma to treat as no-match.
+    """
+    from acoustid import WebServiceError
+
+    res = None
+    last_exc: Exception | None = None
+    for attempt in range(1, _ACOUSTID_RETRIES + 1):
+        try:
+            res = fn(*args, **kwargs)
+            last_exc = None
+            if res.get("status") == "ok":
+                return res
+            message = (res.get("error") or {}).get("message") or "unknown error"
+            if _is_permanent_acoustid_error(res):
+                log.error("acoustid lookup rejected, not retrying: %s", message)
+                return res
+            reason = f"status=error ({message})"
+        except WebServiceError as exc:
+            res = None
+            last_exc = exc
+            reason = str(exc)
+        if attempt < _ACOUSTID_RETRIES:
+            log.warning(
+                "acoustid lookup failed (%s); retry %d/%d",
+                reason, attempt, _ACOUSTID_RETRIES,
+            )
+            time.sleep(_ACOUSTID_BACKOFF * 2 ** (attempt - 1))
+    log.error("acoustid lookup failed after %d attempts (%s)", _ACOUSTID_RETRIES, reason)
+    if last_exc is not None:
+        raise last_exc
+    return res
+
+
+def patch_acoustid_lookup() -> None:
+    """Wrap ``acoustid.lookup`` with the retry policy (idempotent).
+
+    chroma resolves ``acoustid.lookup`` by attribute at call time, so reassigning
+    the module attribute is enough; the signature and compressed-POST body are
+    untouched (we delegate through ``*args``).
+    """
+    import acoustid
+
+    if getattr(acoustid.lookup, "_muvult_retry", False):
+        return
+    original = acoustid.lookup
+
+    def _lookup(*args, **kwargs):
+        return _acoustid_lookup_with_retry(original, *args, **kwargs)
+
+    _lookup._muvult_retry = True
+    acoustid.lookup = _lookup
 
 
 def _patch_search_query() -> None:

@@ -33,6 +33,28 @@ def test_image_ext_by_magic_number():
     assert _image_ext(b"garbage") == ".jpg"  # unknown -> jpg
 
 
+def test_setup_beets_overrides_acoustid_key(monkeypatch, tmp_path):
+    # Our own AcoustID key replaces chroma's globally-shared (rate-limited) one.
+    import beetsplug.chroma as chroma
+    import src.beets_svc as bs
+
+    monkeypatch.setattr(bs, "Library", MagicMock())
+    monkeypatch.setattr(chroma, "API_KEY", chroma.API_KEY)  # snapshot for restore
+    bs.setup_beets(str(tmp_path), acoustid_api_key="MY-OWN-KEY")
+    assert chroma.API_KEY == "MY-OWN-KEY"
+
+
+def test_setup_beets_keeps_default_acoustid_key_when_unset(monkeypatch, tmp_path):
+    import beetsplug.chroma as chroma
+    import src.beets_svc as bs
+
+    monkeypatch.setattr(bs, "Library", MagicMock())
+    default = chroma.API_KEY
+    monkeypatch.setattr(chroma, "API_KEY", default)
+    bs.setup_beets(str(tmp_path), acoustid_api_key=None)
+    assert chroma.API_KEY == default
+
+
 def test_fetch_cover_art_full_returns_bytes_and_ext():
     with patch("src.beets_svc.urlopen") as m:
         m.return_value.__enter__.return_value.read.return_value = _PNG
