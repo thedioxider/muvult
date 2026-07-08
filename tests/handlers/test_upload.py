@@ -455,6 +455,40 @@ async def test_status_updates_are_coalesced_and_skip_unchanged(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_multi_partition_edits_are_spaced_one_per_window(monkeypatch):
+    # A multi-message batch must not burst every dirty partition into one window:
+    # the worker edits one partition per throttle sleep, round-robin.
+    sleeps: list[float] = []
+
+    async def fake_sleep(s):
+        sleeps.append(s)
+
+    monkeypatch.setattr(upload.asyncio, "sleep", fake_sleep)
+    tg_id = 90006
+    batch = upload._UserBatch()
+    batch.states = {
+        "a": FileState("a.mp3", FileStatus.IMPORTED),
+        "b": FileState("b.mp3", FileStatus.IMPORTED),
+    }
+    batch.position = {"a": 0, "b": 1}
+    batch.message_ids = [10, 20]
+    batch.chat_id = 999
+    upload._user_batches[tg_id] = batch
+
+    bot = AsyncMock()
+    await upload._report_batch_status(bot, tg_id, "a")
+    await upload._report_batch_status(bot, tg_id, "b")
+    await upload._status_workers[tg_id]
+
+    # Both partitions edited (their own message), each followed by its own window.
+    edited_msgs = {kw["message_id"] for _, kw in bot.edit_message_text.call_args_list}
+    assert edited_msgs == {10, 20}
+    assert len(sleeps) == 2  # one throttle window per edit -- not both in a single burst
+    upload._user_batches.pop(tg_id, None)
+    upload._status_last_text.clear()
+
+
+@pytest.mark.asyncio
 async def test_prompt_throttle_waits_longer_after_a_fast_answer(monkeypatch):
     # The pace between consecutive prompt sends shrinks the longer the user spent
     # on the previous prompt: a fast answer waits ~the full window, a slow answer

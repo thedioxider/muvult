@@ -39,6 +39,10 @@ class Settings(BaseSettings):
     bot_api_url: str | None = None
     bot_api_local: bool = False
 
+    # Who a user should contact if Telegram flood-control keeps stalling their
+    # uploads (e.g. "@handle"). Shown in the delay notice; unset -> generic wording.
+    support_contact: str | None = None
+
     @field_validator("admin_tg_ids", mode="before")
     @classmethod
     def parse_ids(cls, v: Any) -> list[int]:

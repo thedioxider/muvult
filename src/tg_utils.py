@@ -36,6 +36,14 @@ async def safe_answer(callback: CallbackQuery, *args, **kwargs) -> None:
 # well under this, so in practice we always wait them out).
 _FLOOD_MAX_ATTEMPTS = 5
 _FLOOD_MAX_WAIT = 600  # seconds (10 min); a longer ban than this we refuse to block on
+_FLOOD_NOTIFY_AFTER = 60  # seconds of accumulated wait before we explain the stall to the user
+
+# Cumulative seconds we've blocked on flood control per chat during the current
+# episode; reset the moment a request to that chat succeeds. Chats we're mid-way
+# through notifying are tracked so the notice's own send can't recurse into
+# another notice.
+_flood_waited: dict[int, float] = {}
+_flood_notifying: set[int] = set()
 
 
 class FloodControlMiddleware(BaseRequestMiddleware):
@@ -45,17 +53,49 @@ class FloodControlMiddleware(BaseRequestMiddleware):
         bot: Bot,
         method: TelegramMethod[TelegramType],
     ) -> Response[TelegramType]:
+        chat_id = getattr(method, "chat_id", None)
         for attempt in range(_FLOOD_MAX_ATTEMPTS):
             try:
-                return await make_request(bot, method)
+                result = await make_request(bot, method)
             except TelegramRetryAfter as e:
                 # Exhausted, or an implausibly long ban: give up (re-raise) and
                 # hand back to the caller's own error handling.
                 if attempt == _FLOOD_MAX_ATTEMPTS - 1 or e.retry_after > _FLOOD_MAX_WAIT:
                     raise
+                wait = e.retry_after + 0.5  # exact server value + small buffer past the window
+                if chat_id is not None:
+                    _flood_waited[chat_id] = _flood_waited.get(chat_id, 0.0) + wait
                 log.warning(
                     "flood control on %s: waiting %ss then retrying (%d/%d)",
                     type(method).__name__, e.retry_after, attempt + 1, _FLOOD_MAX_ATTEMPTS - 1,
                 )
-                await asyncio.sleep(e.retry_after + 0.5)  # exact server value + small buffer past the window
+                await asyncio.sleep(wait)
+                continue
+            # Success: if this chat was held up long enough, tell the user why the
+            # updates stalled (once per episode; fire-and-forget so we don't delay
+            # the result we just got back).
+            if chat_id is not None:
+                waited = _flood_waited.pop(chat_id, 0.0)
+                if waited > _FLOOD_NOTIFY_AFTER and chat_id not in _flood_notifying:
+                    asyncio.create_task(self._explain_delay(bot, chat_id, waited))
+            return result
         raise AssertionError("unreachable: loop returns or raises")
+
+    async def _explain_delay(self, bot: Bot, chat_id: int, waited: float) -> None:
+        _flood_notifying.add(chat_id)  # guard: this send flooding must not spawn another notice
+        try:
+            from .config import settings
+
+            contact = getattr(settings, "support_contact", None)
+            whom = contact if contact else "the bot administrator"
+            await bot.send_message(
+                chat_id,
+                f"⚠️ Telegram temporarily rate-limited this chat, so status updates "
+                f"paused for about {round(waited)}s. This can happen on large uploads "
+                f"(many status and confirmation messages at once) — your files were "
+                f"still processed in the background. If it keeps happening, please contact {whom}.",
+            )
+        except Exception:
+            log.warning("failed to send flood-delay notice to chat %s", chat_id, exc_info=True)
+        finally:
+            _flood_notifying.discard(chat_id)

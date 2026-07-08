@@ -163,36 +163,33 @@ async def _report_batch_status(bot: Bot, tg_id: int, file_id: str) -> None:
 
 
 async def _drain_status_updates(bot: Bot, tg_id: int) -> None:
-    """Coalesce pending status edits into at most one per partition per window.
+    """Coalesce pending status edits into at most one edit per throttle window.
 
-    Each pass renders every dirty partition's *current* state (so the latest
-    transition always wins, and the terminal state lands even if it arrived while
-    the worker was sleeping), skips partitions whose text is unchanged, then
-    sleeps out the throttle window before looking again. Exits when nothing is
-    dirty, re-arming if a transition slipped in during the final pass, and closes
-    the batch once it's fully drained.
+    Handles *one* dirty partition per pass (lowest index first), rendering its
+    *current* state -- so the latest transition always wins, the terminal state
+    lands even if it arrived mid-sleep, and a multi-message batch's partitions
+    take turns rather than bursting several edits into one window. A partition
+    whose text is unchanged is dropped without an edit or a wait (costs no
+    rate-limit token); only an edit that actually goes out is followed by the
+    throttle sleep. Exits when nothing is dirty, re-arming if a transition
+    slipped in during the final pass, and closes the batch once fully drained.
     """
     try:
         while _status_dirty.get(tg_id):
-            idxs = _status_dirty.pop(tg_id)
             async with _get_batch_lock(tg_id):
+                dirty = _status_dirty.get(tg_id)
+                if not dirty:
+                    break
+                idx = min(dirty)  # round-robin by index; finite transitions drain them all
+                dirty.discard(idx)
+                if not dirty:
+                    _status_dirty.pop(tg_id, None)
                 batch = _user_batches.get(tg_id)
                 if batch is None:
                     return
-                for idx in sorted(idxs):
-                    if idx >= len(batch.message_ids):
-                        continue
-                    text = _format_status_message(_partition_states(batch, idx))
-                    if _status_last_text.get((tg_id, idx)) == text:
-                        continue  # nothing changed since the last edit -- don't spend a token
-                    try:
-                        await bot.edit_message_text(
-                            text, chat_id=batch.chat_id, message_id=batch.message_ids[idx], parse_mode="HTML"
-                        )
-                        _status_last_text[(tg_id, idx)] = text
-                    except Exception:
-                        pass
-            await asyncio.sleep(_STATUS_THROTTLE_SECONDS)
+                edited = await _render_partition(bot, tg_id, batch, idx)
+            if edited:
+                await asyncio.sleep(_STATUS_THROTTLE_SECONDS)
     finally:
         _status_workers.pop(tg_id, None)
         if _status_dirty.get(tg_id):  # a transition arrived during the final pass
@@ -202,6 +199,27 @@ async def _drain_status_updates(bot: Bot, tg_id: int) -> None:
             batch = _user_batches.get(tg_id)
             if batch is not None:
                 _maybe_close_batch(tg_id, batch)
+
+
+async def _render_partition(bot: Bot, tg_id: int, batch: _UserBatch, idx: int) -> bool:
+    """Edit one partition's message to its current state; caller holds the lock.
+
+    Returns whether an edit was actually sent -- an unchanged render is skipped
+    so it neither spends a rate-limit token nor triggers the throttle wait.
+    """
+    if idx >= len(batch.message_ids):
+        return False
+    text = _format_status_message(_partition_states(batch, idx))
+    if _status_last_text.get((tg_id, idx)) == text:
+        return False
+    try:
+        await bot.edit_message_text(
+            text, chat_id=batch.chat_id, message_id=batch.message_ids[idx], parse_mode="HTML"
+        )
+        _status_last_text[(tg_id, idx)] = text
+        return True
+    except Exception:
+        return False
 
 
 async def _flush_user_batch(bot: Bot, tg_id: int, chat_id: int) -> None:
