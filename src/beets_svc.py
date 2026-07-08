@@ -323,8 +323,10 @@ def _get_recording_full(rec_id: str) -> dict | None:
     try:
         return plugin.mb_api.get_recording(
             rec_id,
+            # "work-rels" is needed alongside RECORDING_INCLUDES's
+            # "work-level-rels" -- without it composer/lyricist come back empty.
             includes=RECORDING_INCLUDES
-            + ["releases", "release-groups", "media", "artist-credits"],
+            + ["work-rels", "releases", "release-groups", "media", "artist-credits"],
         )
     except Exception:
         log.exception("recording lookup failed for %s", rec_id)
