@@ -23,12 +23,16 @@ async def test_create_library(client):
     with respx.mock:
         _mock_auth()
         # create_library lists existing libraries first, then creates.
+        # The real Navidrome POST /api/library serializes the new id as a
+        # *string* ({"id":"7"}), unlike GET which returns an int -- create_library
+        # must coerce it, or set_user_library's {"libraryIds":["7"]} 400s.
         respx.get(f"{BASE}/api/library").mock(return_value=httpx.Response(200, json=[]))
         respx.post(f"{BASE}/api/library").mock(
-            return_value=httpx.Response(200, json={"id": 7, "name": "alice", "path": "/muvult/alice"})
+            return_value=httpx.Response(200, json={"id": "7"})
         )
         lib_id = await client.create_library("alice")
     assert lib_id == 7
+    assert isinstance(lib_id, int)
 
 
 @pytest.mark.asyncio

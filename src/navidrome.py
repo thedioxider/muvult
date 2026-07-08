@@ -48,7 +48,10 @@ class NavidromeClient:
             if lib.get("path") == path:
                 return lib["id"]
         r = await self._request("POST", "/api/library", json={"name": f"{username}'s library", "path": path})
-        return r.json()["id"]
+        # POST serializes the new id as a string ({"id":"7"}) while GET returns
+        # an int; coerce so set_user_library sends {"libraryIds":[7]}, not
+        # {"libraryIds":["7"]} which Navidrome 400s (can't decode str into []int).
+        return int(r.json()["id"])
 
     async def update_library(self, library_id: int, username: str) -> None:
         await self._request("PUT", f"/api/library/{library_id}", json={"name": f"{username}'s library", "path": f"{self._music_path}/{username}"})
