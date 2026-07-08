@@ -160,66 +160,103 @@ def _nearest_release_length(rec: dict, file_length_s: float | None) -> float | N
     return best / 1000.0 if best is not None else None
 
 
-def _fingerprint_item(item: Item) -> set[str]:
-    """AcoustID recording ids for this file's audio, or an empty set.
+def _fingerprint_item(item: Item) -> tuple[set[str], float | None]:
+    """AcoustID recording ids for this file's audio plus the cluster score.
 
     Runs the chroma fingerprint lookup ourselves (muvult never enters beets'
     import pipeline, where chroma would otherwise trigger it) so that chroma's
     ``item_candidates`` fires inside the following ``tag_item`` -- and so we know
-    which candidates are fingerprint-backed. Fully guarded: a missing ``fpcalc``
-    binary, a network failure, or no match all degrade to search-only tagging.
+    which candidates are fingerprint-backed. The AcoustID cluster score (which
+    chroma computes and discards) is captured via the ``acoustid.lookup`` wrapper
+    and returned alongside the ids; it is ``None`` when no lookup ran or the
+    response carried none. Fully guarded: a missing ``fpcalc`` binary, a network
+    failure, or no match all degrade to search-only tagging (empty set, no score).
     """
+    from .beets_patches import last_fingerprint_score, reset_fingerprint_score
+
+    reset_fingerprint_score()
     try:
         from beetsplug import chroma
 
         chroma.acoustid_match(log, item.path)
         match = chroma._matches.get(item.path)
-        return set(match[0]) if match else set()
+        ids = set(match[0]) if match else set()
     except Exception:
         log.exception("acoustid fingerprint lookup failed")
-        return set()
+        return set(), None
+    return ids, last_fingerprint_score()
+
+
+def _confidence(distance: float, score: float | None) -> float:
+    """Combined match confidence in [0, 1].
+
+    ``(1 - distance)`` is beets' per-candidate text-match confidence; multiplying
+    by the AcoustID cluster ``score`` (when present) anchors a fingerprint match's
+    magnitude to the actual audio confidence instead of the file's stale tags.
+    """
+    base = 1.0 - distance
+    if score is not None:
+        base *= score
+    return max(0.0, min(1.0, base))
+
+
+def _build_candidates(matches: list, score: float | None) -> list[Candidate]:
+    """Confidence-scored, confidence-sorted, self-indexed Candidate list.
+
+    ``score`` is the AcoustID cluster score for a fingerprint set, or ``None`` for
+    a text set (chroma factor 1). Candidates are sorted best-confidence-first and
+    re-indexed 0..n so a button's ``.index`` equals its position in this list --
+    which is how the confirmation callback resolves a selection.
+    """
+    cands = [
+        Candidate(
+            index=0,
+            artist=m.info.artist or "",
+            title=m.info.title or "",
+            album=m.info.album or "",
+            year=getattr(m.info, "year", None),
+            mb_track_id=m.info.track_id,
+            distance=m.distance.distance,
+            _match=m,
+            length=getattr(m.info, "length", None),
+            disambig=getattr(m.info, "trackdisambig", None),
+            confidence=_confidence(m.distance.distance, score),
+        )
+        for m in matches
+    ]
+    cands.sort(key=lambda c: c.confidence, reverse=True)
+    for i, c in enumerate(cands):
+        c.index = i
+    return cands
 
 
 def _get_candidates_sync(file_path: Path) -> TagResult:
     item = Item.from_path(str(file_path))
-    fp_ids = _fingerprint_item(item)
+    fp_ids, fp_score = _fingerprint_item(item)
     proposal = tag_item(item)
-    # A fingerprint match is the authoritative audio identity: when present, the
-    # candidate set is *only* the fingerprinted recordings (deduped as usual),
-    # and text-search hits are discarded. Text search is the fallback used solely
-    # when the fingerprint found nothing (unknown/obscure track).
+    # The full text-search net is always built (and kept): it backs the "Show all
+    # results" reveal and the OFF below-threshold fallback. A fingerprint match is
+    # the authoritative audio identity, so when present the *primary* candidate set
+    # is only the fingerprinted recordings, scored with the AcoustID cluster score.
+    search_candidates = _build_candidates(_dedup_matches(proposal.candidates), None)
     fp_matches = [m for m in proposal.candidates if m.info.track_id in fp_ids]
     if fp_matches:
-        matches = _dedup_matches(fp_matches)
+        candidates = _build_candidates(_dedup_matches(fp_matches), fp_score)
         fingerprinted = True
-        # A fingerprint hit is the authoritative audio identity, so it enters the
-        # confirmation gate as strong regardless of how the stale tags text-scored.
+        # A fingerprint hit enters the confirmation gate as strong regardless of
+        # how the stale tags text-scored; the real text recommendation is kept in
+        # search_recommendation for the OFF fallback.
         recommendation = Recommendation.strong
     else:
-        matches = _dedup_matches(proposal.candidates)
+        candidates = search_candidates
         fingerprinted = False
         recommendation = proposal.recommendation
-    candidates = []
-    for i, match in enumerate(matches):
-        info = match.info
-        candidates.append(
-            Candidate(
-                index=i,
-                artist=info.artist or "",
-                title=info.title or "",
-                album=info.album or "",
-                year=getattr(info, "year", None),
-                mb_track_id=info.track_id,
-                distance=match.distance.distance,
-                _match=match,
-                length=getattr(info, "length", None),
-                disambig=getattr(info, "trackdisambig", None),
-            )
-        )
     return TagResult(
         candidates=candidates,
         recommendation=recommendation,
         fingerprinted=fingerprinted,
+        search_candidates=search_candidates,
+        search_recommendation=proposal.recommendation,
     )
 
 

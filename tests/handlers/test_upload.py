@@ -16,10 +16,11 @@ from src.db import init_db, get_session, Track, TrackOwnership, User
 from src.pool import create_symlink, find_cover
 
 
-def _c(index, artist, title, disambig=None):
+def _c(index, artist, title, disambig=None, confidence=0.0):
     return Candidate(
         index=index, artist=artist, title=title, album="", year=None,
         mb_track_id=f"id{index}", distance=0.0, _match=None, disambig=disambig,
+        confidence=confidence,
     )
 
 
@@ -127,6 +128,55 @@ def test_render_list_page_button_carries_global_index():
     datas = [b.callback_data for row in markup.inline_keyboard for b in row]
     assert f"conf{sep}6" in datas   # candidate #7 -> index 6
     assert f"conf{sep}7" in datas
+
+
+def test_render_list_page_button_shows_confidence_percent():
+    cands = [_c(0, "A", "T0", confidence=0.63), _c(1, "A", "T1", confidence=0.9)]
+    _, markup = upload._render_list_page(_req(cands))
+    labels = _btn_texts(markup)
+    assert any("63%" in t for t in labels)
+    assert any("90%" in t for t in labels)
+
+
+def _fp_req(candidates, search_candidates, page=0, showing_all=False):
+    from src.models import TagResult
+    return upload._ConfirmationRequest(
+        filename="song.mp3",
+        tag_result=TagResult(
+            candidates=candidates, recommendation=0, fingerprinted=True,
+            search_candidates=search_candidates,
+        ),
+        file_path=None,
+        future=MagicMock(),
+        page=page,
+        showing_all=showing_all,
+    )
+
+
+def test_fingerprint_prompt_offers_show_all_results():
+    sep = upload._CB_SEP
+    fp = [_c(0, "SOAD", "Aerials", confidence=0.7)]
+    search = [_c(0, "SOAD", "Aerials"), _c(1, "Other", "Aerials")]
+    _, markup = upload._render_list_page(_fp_req(fp, search))
+    assert f"conf{sep}showall" in _btn_datas(markup)
+
+
+def test_show_all_swaps_to_search_candidates_and_hides_button():
+    sep = upload._CB_SEP
+    fp = [_c(0, "SOAD", "Aerials", confidence=0.7)]
+    search = [_c(0, "SOAD", "Aerials"), _c(1, "Other", "Aerials")]
+    req = _fp_req(fp, search, showing_all=True)
+    text, markup = upload._render_list_page(req)
+    # The full text net is now in view; the reveal button is gone.
+    assert "Other — Aerials" in text
+    assert f"conf{sep}showall" not in _btn_datas(markup)
+
+
+def test_non_fingerprint_prompt_has_no_show_all_button():
+    sep = upload._CB_SEP
+    cands = [_c(i, "A", f"T{i}") for i in range(3)]
+    _, markup = upload._render_list_page(_req(cands))
+    assert f"conf{sep}showall" not in _btn_datas(markup)
 
 
 def test_row_sizes_first_page():

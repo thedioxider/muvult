@@ -395,7 +395,7 @@ def test_get_candidates_sync_maps_fields(tmp_path):
 
     with (
         patch("src.beets_svc.Item.from_path", return_value=MagicMock()),
-        patch("src.beets_svc._fingerprint_item", return_value=set()),
+        patch("src.beets_svc._fingerprint_item", return_value=(set(), None)),
         patch("src.beets_svc.tag_item", return_value=proposal),
     ):
         result = _get_candidates_sync(audio)
@@ -407,8 +407,12 @@ def test_get_candidates_sync_maps_fields(tmp_path):
     assert c.title == "Creep"
     assert c.mb_track_id == "mb-track-abc"
     assert c.distance == pytest.approx(0.05)
+    # No fingerprint -> confidence is just (1 - distance); primary == search set.
+    assert c.confidence == pytest.approx(0.95)
     assert result.recommendation == 3
     assert result.fingerprinted is False
+    assert result.candidates is result.search_candidates
+    assert result.search_recommendation == 3
 
 
 def test_get_candidates_sync_fingerprint_is_exclusive(tmp_path):
@@ -427,7 +431,7 @@ def test_get_candidates_sync_fingerprint_is_exclusive(tmp_path):
 
     with (
         patch("src.beets_svc.Item.from_path", return_value=MagicMock()),
-        patch("src.beets_svc._fingerprint_item", return_value={"fp-id"}),
+        patch("src.beets_svc._fingerprint_item", return_value=({"fp-id"}, 0.9)),
         patch("src.beets_svc.tag_item", return_value=proposal),
     ):
         result = _get_candidates_sync(audio)
@@ -435,6 +439,12 @@ def test_get_candidates_sync_fingerprint_is_exclusive(tmp_path):
     assert [c.mb_track_id for c in result.candidates] == ["fp-id"]
     assert result.fingerprinted is True
     assert result.recommendation == Recommendation.strong
+    # Combined confidence = (1 - text_distance) * cluster_score = 0.70 * 0.9.
+    assert result.candidates[0].confidence == pytest.approx(0.63)
+    # The full text net is kept (both hits) for "Show all results" / OFF fallback,
+    # and the real text recommendation is preserved separately.
+    assert {c.mb_track_id for c in result.search_candidates} == {"fp-id", "wrong-id"}
+    assert result.search_recommendation == Recommendation.none
 
 
 def _mk_apply_mocks(dest, *, rec=None, track_data=None, artist="half·alive"):

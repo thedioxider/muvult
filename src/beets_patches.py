@@ -50,6 +50,25 @@ _ACOUSTID_BACKOFF = 0.5  # seconds; doubled each attempt (0.5s, 1.0s, ...)
 # it survives AcoustID renumbering its error codes.
 _ACOUSTID_PERMANENT_ERRORS = ("api key", "invalid fingerprint", "invalid uuid")
 
+# chroma reads only ``results[0]["score"]`` and then throws it away, but that
+# per-cluster acoustic score is exactly what we need to compute an honest combined
+# confidence. Our ``acoustid.lookup`` wrapper is the one place that sees the raw
+# response, and all beets work is serialized on one thread (``_beets_pool``), so a
+# module-level holder is race-free: ``_fingerprint_item`` resets it, calls
+# ``chroma.acoustid_match`` (which calls the wrapped lookup once), then reads it.
+_last_lookup_score: float | None = None
+
+
+def last_fingerprint_score() -> float | None:
+    """The score of the top AcoustID cluster from the most recent lookup, or None."""
+    return _last_lookup_score
+
+
+def reset_fingerprint_score() -> None:
+    """Clear the stashed score before a fingerprint lookup that may not run one."""
+    global _last_lookup_score
+    _last_lookup_score = None
+
 
 def patch_mb_search() -> None:
     """Apply the recording-search reshaping patches (idempotent)."""
@@ -121,7 +140,14 @@ def patch_acoustid_lookup() -> None:
     original = acoustid.lookup
 
     def _lookup(*args, **kwargs):
-        return _acoustid_lookup_with_retry(original, *args, **kwargs)
+        global _last_lookup_score
+        res = _acoustid_lookup_with_retry(original, *args, **kwargs)
+        try:
+            results = (res or {}).get("results") or []
+            _last_lookup_score = results[0].get("score") if results else None
+        except Exception:
+            _last_lookup_score = None
+        return res
 
     _lookup._muvult_retry = True
     acoustid.lookup = _lookup
