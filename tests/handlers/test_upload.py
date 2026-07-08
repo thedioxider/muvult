@@ -382,7 +382,8 @@ def test_partition_states_filters_by_index():
 
 
 @pytest.mark.asyncio
-async def test_report_batch_status_edits_only_own_partition():
+async def test_report_batch_status_edits_only_own_partition(monkeypatch):
+    monkeypatch.setattr(upload, "_STATUS_THROTTLE_SECONDS", 0)
     tg_id = 90001
     batch = upload._UserBatch()
     batch.states = {
@@ -396,6 +397,7 @@ async def test_report_batch_status_edits_only_own_partition():
 
     bot = AsyncMock()
     await upload._report_batch_status(bot, tg_id, "a")
+    await upload._status_workers[tg_id]  # drive the throttled edit worker to completion
 
     bot.edit_message_text.assert_awaited_once()
     _, kwargs = bot.edit_message_text.call_args
@@ -404,10 +406,12 @@ async def test_report_batch_status_edits_only_own_partition():
     # "b" isn't terminal yet, so the batch must still be open.
     assert tg_id in upload._user_batches
     upload._user_batches.pop(tg_id, None)
+    upload._status_last_text.clear()
 
 
 @pytest.mark.asyncio
-async def test_report_batch_status_closes_when_all_terminal():
+async def test_report_batch_status_closes_when_all_terminal(monkeypatch):
+    monkeypatch.setattr(upload, "_STATUS_THROTTLE_SECONDS", 0)
     tg_id = 90002
     batch = upload._UserBatch()
     batch.states = {"a": FileState("a.mp3", FileStatus.IMPORTED)}
@@ -418,8 +422,54 @@ async def test_report_batch_status_closes_when_all_terminal():
 
     bot = AsyncMock()
     await upload._report_batch_status(bot, tg_id, "a")
+    await upload._status_workers[tg_id]
 
     assert tg_id not in upload._user_batches
+    upload._status_last_text.clear()
+
+
+@pytest.mark.asyncio
+async def test_status_updates_are_coalesced_and_skip_unchanged(monkeypatch):
+    # Rapid transitions on one partition collapse to far fewer edits than
+    # transitions, and an unchanged render never spends an edit at all.
+    monkeypatch.setattr(upload, "_STATUS_THROTTLE_SECONDS", 0.05)
+    tg_id = 90005
+    batch = upload._UserBatch()
+    batch.states = {"a": FileState("a.mp3", FileStatus.DOWNLOADING)}
+    batch.position = {"a": 0}
+    batch.message_ids = [10]
+    batch.chat_id = 999
+    upload._user_batches[tg_id] = batch
+
+    bot = AsyncMock()
+    for st in (FileStatus.DOWNLOADING, FileStatus.TAGGING, FileStatus.PENDING, FileStatus.IMPORTED):
+        batch.states["a"].status = st
+        await upload._report_batch_status(bot, tg_id, "a")
+    await upload._status_workers[tg_id]
+
+    # Four transitions, but coalesced into at most two edits (never one-per-tick).
+    assert 1 <= bot.edit_message_text.await_count <= 2
+    # Terminal state landed and the batch closed.
+    assert tg_id not in upload._user_batches
+    upload._status_last_text.clear()
+
+
+@pytest.mark.asyncio
+async def test_prompt_throttle_waits_longer_after_a_fast_answer(monkeypatch):
+    # The pace between consecutive prompt sends shrinks the longer the user spent
+    # on the previous prompt: a fast answer waits ~the full window, a slow answer
+    # only the floor hold.
+    monkeypatch.setattr(upload, "_PROMPT_THROTTLE_SECONDS", 1.0)
+    monkeypatch.setattr(upload, "_PROMPT_MIN_HOLD_SECONDS", 0.1)
+    loop = asyncio.get_running_loop()
+
+    def wait_after(think: float) -> float:
+        last_sent = loop.time() - think  # user spent `think` seconds on the last prompt
+        return max(upload._PROMPT_MIN_HOLD_SECONDS, upload._PROMPT_THROTTLE_SECONDS - (loop.time() - last_sent))
+
+    assert wait_after(0.0) == pytest.approx(1.0, abs=0.05)   # instant click -> full window
+    assert wait_after(0.6) == pytest.approx(0.4, abs=0.05)   # partial think -> remainder
+    assert wait_after(5.0) == upload._PROMPT_MIN_HOLD_SECONDS  # long think -> just the floor
 
 
 @pytest.mark.asyncio

@@ -64,6 +64,33 @@ _user_batches: dict[int, _UserBatch] = {}
 _batch_locks: dict[int, asyncio.Lock] = {}
 _batch_debounce_tasks: dict[int, asyncio.Task] = {}
 
+# Live status edits are throttled. Editing on *every* file transition spends a
+# Telegram per-chat rate-limit token per edit -- edits share the same
+# burst-tolerant ~1 msg/s per-chat bucket as sends/deletes -- and a multi-track
+# upload's transitions burst well past that, tripping flood control (429), which
+# silently froze the status message mid-upload while the imports themselves kept
+# going. Instead each transition marks its partition dirty and one per-user
+# worker coalesces them into at most one edit per partition per
+# _STATUS_THROTTLE_SECONDS, always rendering the *latest* state (so the terminal
+# state still lands) and skipping the edit when the text hasn't changed. Flush
+# resends and confirmation prompts are deliberately left alone -- resends are
+# rare (once per debounce settle) and prompts are paced by the user's clicks.
+_STATUS_THROTTLE_SECONDS = 2.0
+_status_dirty: dict[int, set[int]] = {}  # tg_id -> dirty partition indices
+_status_workers: dict[int, asyncio.Task] = {}
+_status_last_text: dict[tuple[int, int], str] = {}  # (tg_id, idx) -> last rendered text
+
+# Confirmation prompts share the same per-chat bucket: each answered prompt fires
+# a delete (of the answered one) plus a send (of the next), and a fast clicker
+# can burst these past the limit. Consecutive prompt *sends* are paced
+# dynamically -- the wait is measured against how long the user spent on the
+# previous prompt, so a long deliberation adds only _PROMPT_MIN_HOLD_SECONDS (just
+# enough to separate the delete from the next send), while a quick answer waits
+# out the rest of _PROMPT_THROTTLE_SECONDS. Prompts stay one-message-per-file
+# (sent fresh, deleted on answer) so it's always clear the previous was answered.
+_PROMPT_THROTTLE_SECONDS = 1.0  # target minimum spacing between consecutive prompt sends
+_PROMPT_MIN_HOLD_SECONDS = 0.5  # floor pause after an answer before the next prompt
+
 
 def _get_batch_lock(tg_id: int) -> asyncio.Lock:
     return _batch_locks.setdefault(tg_id, asyncio.Lock())
@@ -107,25 +134,74 @@ def _maybe_close_batch(tg_id: int, batch: _UserBatch) -> None:
     all_done = all(fs.status in _TERMINAL for fs in batch.states.values())
     task = _batch_debounce_tasks.get(tg_id)
     timer_pending = task is not None and not task.done()
-    if all_done and not timer_pending and _user_batches.get(tg_id) is batch:
+    worker = _status_workers.get(tg_id)
+    worker_pending = worker is not None and not worker.done()
+    # Don't close while a throttled status edit is still queued -- the batch must
+    # survive until its final (terminal) state has actually been rendered.
+    if all_done and not timer_pending and not worker_pending and _user_batches.get(tg_id) is batch:
         _user_batches.pop(tg_id, None)
+        _status_dirty.pop(tg_id, None)
+        for key in [k for k in _status_last_text if k[0] == tg_id]:
+            _status_last_text.pop(key, None)
 
 
 async def _report_batch_status(bot: Bot, tg_id: int, file_id: str) -> None:
+    """Mark a file's partition dirty and ensure a throttled edit worker is running.
+
+    Editing here directly, on every transition, floods the per-chat rate limit
+    (see the _STATUS_THROTTLE_SECONDS note above); instead the actual edit is
+    coalesced and rate-limited by _drain_status_updates.
+    """
     async with _get_batch_lock(tg_id):
         batch = _user_batches.get(tg_id)
         if batch is None or file_id not in batch.position:
             return
         idx = batch.position[file_id]
-        if idx < len(batch.message_ids):
-            text = _format_status_message(_partition_states(batch, idx))
-            try:
-                await bot.edit_message_text(
-                    text, chat_id=batch.chat_id, message_id=batch.message_ids[idx], parse_mode="HTML"
-                )
-            except Exception:
-                pass
-        _maybe_close_batch(tg_id, batch)
+    _status_dirty.setdefault(tg_id, set()).add(idx)
+    if tg_id not in _status_workers or _status_workers[tg_id].done():
+        _status_workers[tg_id] = asyncio.create_task(_drain_status_updates(bot, tg_id))
+
+
+async def _drain_status_updates(bot: Bot, tg_id: int) -> None:
+    """Coalesce pending status edits into at most one per partition per window.
+
+    Each pass renders every dirty partition's *current* state (so the latest
+    transition always wins, and the terminal state lands even if it arrived while
+    the worker was sleeping), skips partitions whose text is unchanged, then
+    sleeps out the throttle window before looking again. Exits when nothing is
+    dirty, re-arming if a transition slipped in during the final pass, and closes
+    the batch once it's fully drained.
+    """
+    try:
+        while _status_dirty.get(tg_id):
+            idxs = _status_dirty.pop(tg_id)
+            async with _get_batch_lock(tg_id):
+                batch = _user_batches.get(tg_id)
+                if batch is None:
+                    return
+                for idx in sorted(idxs):
+                    if idx >= len(batch.message_ids):
+                        continue
+                    text = _format_status_message(_partition_states(batch, idx))
+                    if _status_last_text.get((tg_id, idx)) == text:
+                        continue  # nothing changed since the last edit -- don't spend a token
+                    try:
+                        await bot.edit_message_text(
+                            text, chat_id=batch.chat_id, message_id=batch.message_ids[idx], parse_mode="HTML"
+                        )
+                        _status_last_text[(tg_id, idx)] = text
+                    except Exception:
+                        pass
+            await asyncio.sleep(_STATUS_THROTTLE_SECONDS)
+    finally:
+        _status_workers.pop(tg_id, None)
+        if _status_dirty.get(tg_id):  # a transition arrived during the final pass
+            _status_workers[tg_id] = asyncio.create_task(_drain_status_updates(bot, tg_id))
+            return
+        async with _get_batch_lock(tg_id):
+            batch = _user_batches.get(tg_id)
+            if batch is not None:
+                _maybe_close_batch(tg_id, batch)
 
 
 async def _flush_user_batch(bot: Bot, tg_id: int, chat_id: int) -> None:
@@ -147,6 +223,7 @@ async def _flush_user_batch(bot: Bot, tg_id: int, chat_id: int) -> None:
             text = _format_status_message(_partition_states(batch, idx))
             msg = await bot.send_message(chat_id, text, parse_mode="HTML")
             batch.message_ids.append(msg.message_id)
+            _status_last_text[(tg_id, idx)] = text  # keep the throttle's cache in step with what's on screen
         batch.chat_id = chat_id
         _batch_debounce_tasks.pop(tg_id, None)
         _maybe_close_batch(tg_id, batch)
@@ -692,13 +769,22 @@ async def _queue_confirmation(
 
 async def _drain_confirmation_queue(bot: Bot, tg_id: int) -> None:
     q = _confirmation_queues.get(tg_id)
+    loop = get_running_loop()
+    last_sent = 0.0  # monotonic time the previous prompt was sent (0 => none yet)
     try:
         while q and not q.empty():
             req: _ConfirmationRequest = await q.get()
             if not req.future.done():
+                if last_sent:
+                    # Pace the next send against how long the user spent on the
+                    # last prompt: a quick answer waits out the rest of the
+                    # throttle window, a slow one only the floor hold.
+                    wait = max(_PROMPT_MIN_HOLD_SECONDS, _PROMPT_THROTTLE_SECONDS - (loop.time() - last_sent))
+                    await asyncio.sleep(wait)
                 _active_confirmations[tg_id] = req
                 try:
                     await _ask_confirmation(bot, tg_id, req)
+                    last_sent = loop.time()
                     await req.future
                 except Exception as e:
                     if not req.future.done():
