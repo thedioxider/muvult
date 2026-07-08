@@ -250,6 +250,14 @@ async def _flush_user_batch(bot: Bot, tg_id: int, chat_id: int) -> None:
 # concurrent uploads of the same track can't collide on the unique pool_path.
 _pool_commit_lock = asyncio.Lock()
 
+# Bounds concurrent downloads: handle_audio spawns one unbounded _process_file
+# task per file, so a 100-file drop would fire 100 parallel bot.download calls,
+# saturating the (local) Bot API server and aiogram's aiohttp pool until get_file
+# times out. Tagging is serialized on _beets_pool anyway, so a small cap loses
+# nothing.
+_DOWNLOAD_CONCURRENCY = 4
+_download_semaphore = asyncio.Semaphore(_DOWNLOAD_CONCURRENCY)
+
 _STATUS_ICONS = {
     FileStatus.DOWNLOADING: "📥",
     FileStatus.TAGGING: "🔍",
@@ -579,7 +587,8 @@ async def _process_file(
     try:
         states[file_id] = FileState(filename, FileStatus.DOWNLOADING)
         await report()
-        await bot.download(file_id, destination=file_path)
+        async with _download_semaphore:
+            await bot.download(file_id, destination=file_path)
         log.info("received %r (tg_id=%s, %d bytes)", filename, tg_id, file_path.stat().st_size)
 
         states[file_id].status = FileStatus.TAGGING
