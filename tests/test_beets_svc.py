@@ -8,11 +8,68 @@ from src.beets_svc import (
     _get_candidates_sync,
     _apply_and_stage_sync,
     _stage_as_is_sync,
+    _fetch_cover_art_full,
+    _image_ext,
     _nearest_release_length,
-    _album_for_id_cached,
+    _album_fields,
+    _format_artist_credit,
+    _track_numbering,
+    _year_of,
     select_release,
-    earliest_official_year,
 )
+
+
+_JPEG = b"\xff\xd8\xff\xe0\x00\x10JFIF" + b"\x00" * 32
+_PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+_WEBP = b"RIFF\x00\x00\x00\x00WEBPVP8 " + b"\x00" * 16
+_GIF = b"GIF89a" + b"\x00" * 32
+
+
+def test_image_ext_by_magic_number():
+    assert _image_ext(_JPEG) == ".jpg"
+    assert _image_ext(_PNG) == ".png"
+    assert _image_ext(_WEBP) == ".webp"
+    assert _image_ext(_GIF) == ".gif"
+    assert _image_ext(b"garbage") == ".jpg"  # unknown -> jpg
+
+
+def test_setup_beets_overrides_acoustid_key(monkeypatch, tmp_path):
+    # Our own AcoustID key replaces chroma's globally-shared (rate-limited) one.
+    import beetsplug.chroma as chroma
+    import src.beets_svc as bs
+
+    monkeypatch.setattr(bs, "Library", MagicMock())
+    monkeypatch.setattr(chroma, "API_KEY", chroma.API_KEY)  # snapshot for restore
+    bs.setup_beets(str(tmp_path), acoustid_api_key="MY-OWN-KEY")
+    assert chroma.API_KEY == "MY-OWN-KEY"
+
+
+def test_setup_beets_keeps_default_acoustid_key_when_unset(monkeypatch, tmp_path):
+    import beetsplug.chroma as chroma
+    import src.beets_svc as bs
+
+    monkeypatch.setattr(bs, "Library", MagicMock())
+    default = chroma.API_KEY
+    monkeypatch.setattr(chroma, "API_KEY", default)
+    bs.setup_beets(str(tmp_path), acoustid_api_key=None)
+    assert chroma.API_KEY == default
+
+
+def test_fetch_cover_art_full_returns_bytes_and_ext():
+    with patch("src.beets_svc.urlopen") as m:
+        m.return_value.__enter__.return_value.read.return_value = _PNG
+        assert _fetch_cover_art_full("rg-png") == (_PNG, ".png")
+
+
+def test_fetch_cover_art_full_swallows_errors():
+    with patch("src.beets_svc.urlopen", side_effect=Exception("boom")):
+        assert _fetch_cover_art_full("rg-fail") is None
+
+
+def test_fetch_cover_art_full_none_on_empty_body():
+    with patch("src.beets_svc.urlopen") as m:
+        m.return_value.__enter__.return_value.read.return_value = b""
+        assert _fetch_cover_art_full("rg-empty") is None
 
 
 def _rel(rid, title, primary, secondary, status, date, country, artist="half•alive"):
@@ -95,26 +152,104 @@ def test_select_release_empty_returns_none():
     assert select_release([]) is None
 
 
-def test_earliest_official_year_uses_single_predating_album():
-    assert earliest_official_year(STILL_FEEL_RELEASES) == 2018
+def test_format_artist_credit_single():
+    credit = [{"name": "Metallica", "joinphrase": "", "artist": {"id": "m1", "name": "Metallica"}}]
+    assert _format_artist_credit(credit) == ("Metallica", ["m1"])
 
 
-def test_earliest_official_year_baba():
-    assert earliest_official_year(BABA_RELEASES) == 1995
-
-
-def test_earliest_official_year_ignores_non_official():
-    rels = [
-        _rel("a", "x", "Album", [], "Bootleg", "1990", "XW"),
-        _rel("b", "x", "Album", [], "Official", "1995", "XW"),
+def test_format_artist_credit_feature_joins_with_joinphrase():
+    credit = [
+        {"name": "Alice", "joinphrase": " feat. ", "artist": {"id": "a"}},
+        {"name": "Bob", "joinphrase": "", "artist": {"id": "b"}},
     ]
-    assert earliest_official_year(rels) == 1995
+    assert _format_artist_credit(credit) == ("Alice feat. Bob", ["a", "b"])
+
+
+def test_format_artist_credit_empty():
+    assert _format_artist_credit(None) == ("", [])
+
+
+def test_year_of():
+    assert _year_of("1983-07-25") == 1983
+    assert _year_of("1983") == 1983
+    assert _year_of(None) is None
+    assert _year_of("") is None
+
+
+def test_track_numbering_reads_disc_and_totals():
+    release = {"media": [{"position": 1, "track_count": 12, "tracks": [{"number": "5"}]}]}
+    assert _track_numbering(release) == {"track": 5, "disc": 1, "tracktotal": 12}
+
+
+def test_track_numbering_skips_nonnumeric_track():
+    # A vinyl "A1" position isn't an int track number -- skip it rather than coerce.
+    release = {"media": [{"position": 1, "tracks": [{"number": "A1"}]}]}
+    assert _track_numbering(release) == {"disc": 1}
+
+
+def test_track_numbering_empty_without_media():
+    assert _track_numbering({"media": []}) == {}
+
+
+def _rg_release(rid, *, rgid="rg1", title="Kill 'Em All", date="1983-07-25",
+                primary="Album", secondary=None, artist="Metallica", artist_id="m1",
+                track="4", disc=1, track_count=12, **extra):
+    """A recording-lookup-shaped release: inline release_group + this recording's
+    own media track. `extra` injects pressing-specific junk that must be dropped."""
+    return {
+        "id": rid,
+        "release_group": {
+            "id": rgid, "title": title, "first_release_date": date,
+            "primary_type": primary, "secondary_types": secondary or [],
+            "artist_credit": [{"name": artist, "artist": {"id": artist_id}}],
+        },
+        "media": [{"position": disc, "track_count": track_count, "tracks": [{"number": track}]}],
+        **extra,
+    }
+
+
+def test_album_fields_identity_from_release_group():
+    data = _album_fields(_rg_release("r1"))
+    assert data["album"] == "Kill 'Em All"
+    assert data["mb_releasegroupid"] == "rg1"
+    assert data["albumartist"] == "Metallica"
+    assert data["mb_albumartistid"] == "m1"
+    assert data["year"] == 1983
+    assert data["albumtype"] == "album"
+    assert data["albumtypes"] == ["album"]
+    assert data["comp"] == 0
+    assert (data["track"], data["disc"], data["tracktotal"]) == (4, 1, 12)
+
+
+def test_album_fields_drops_pressing_specific_junk():
+    # The chosen release may be a German/Japanese pressing carrying country,
+    # catalognum, barcode, its own edition title, mb_albumid -- none of it should
+    # leak into the tags (which would fragment the album across pressings).
+    data = _album_fields(_rg_release(
+        "r1", title="Kill 'Em All",
+        country="DE", barcode="123", disambiguation="made in W Germany",
+    ))
+    for junk in ("mb_albumid", "albumdisambig", "catalognum", "barcode",
+                 "country", "label", "script"):
+        assert junk not in data
+    # album name is the group's canonical title, not any pressing's title
+    assert data["album"] == "Kill 'Em All"
+
+
+def test_album_fields_marks_various_artists_compilation():
+    from src.beets_svc import _VARIOUS_ARTISTS_ID
+    data = _album_fields(_rg_release("r1", artist="Various Artists", artist_id=_VARIOUS_ARTISTS_ID))
+    assert data["comp"] == 1
+
+
+def test_album_fields_none_without_release_group():
+    assert _album_fields({"id": "r1", "release_group": {}}) is None
 
 
 def _mk_match(artist, title, length, isrc, mbid, distance, disambig=None):
     return SimpleNamespace(
         info=SimpleNamespace(
-            artist=artist, title=title, length=length, isrc=isrc,
+            artist=artist, title=title, album=None, length=length, isrc=isrc,
             track_id=mbid, trackdisambig=disambig,
         ),
         distance=SimpleNamespace(distance=distance),
@@ -219,16 +354,18 @@ def test_select_release_length_breaks_edition_tie():
     assert select_release([a, b], "half•alive", 222707)["id"] == "r-b"
 
 
-def test_album_for_id_cached_hits_mb_once():
-    _album_for_id_cached.cache_clear()
-    album = MagicMock()
-    plugin = MagicMock()
-    plugin.album_for_id.return_value = album
-    with patch("src.beets_svc._mb_plugin", return_value=plugin):
-        first = _album_for_id_cached("rel-1")
-        second = _album_for_id_cached("rel-1")
-    assert first is album and second is album
-    plugin.album_for_id.assert_called_once_with("rel-1")
+def test_enrich_from_release_picks_release_then_reads_group():
+    from src.beets_svc import _enrich_from_release
+    # Two releases in the same group; select_release picks one, but album identity
+    # is the group's -- so either pick yields the same album/year/rgid.
+    releases = [
+        _rg_release("r-us", title="Kill 'Em All", date="1983-07-25"),
+        _rg_release("r-jp", title="Kill 'Em All", date="1983-07-25", country="JP"),
+    ]
+    data = _enrich_from_release(releases, "rec-1", "Metallica", None)
+    assert data["album"] == "Kill 'Em All"
+    assert data["mb_releasegroupid"] == "rg1"
+    assert data["year"] == 1983
 
 
 def _make_proposal(distance=0.05, rec=3):
@@ -258,6 +395,7 @@ def test_get_candidates_sync_maps_fields(tmp_path):
 
     with (
         patch("src.beets_svc.Item.from_path", return_value=MagicMock()),
+        patch("src.beets_svc._fingerprint_item", return_value=set()),
         patch("src.beets_svc.tag_item", return_value=proposal),
     ):
         result = _get_candidates_sync(audio)
@@ -270,6 +408,33 @@ def test_get_candidates_sync_maps_fields(tmp_path):
     assert c.mb_track_id == "mb-track-abc"
     assert c.distance == pytest.approx(0.05)
     assert result.recommendation == 3
+    assert result.fingerprinted is False
+
+
+def test_get_candidates_sync_fingerprint_is_exclusive(tmp_path):
+    # A fingerprint match makes the candidate set *only* the fingerprinted
+    # recordings: the text-search hit ("wrong-id") is dropped even though it scored
+    # a lower distance, and the result is flagged strong + fingerprinted.
+    from beets.autotag.match import Recommendation
+    audio = tmp_path / "song.mp3"
+    audio.write_bytes(b"fake")
+
+    fp_hit = _mk_match("Metallica", "Whiplash", 260.0, "US1", "fp-id", 0.30)
+    text_hit = _mk_match("Metallica", "Whiplash?", 260.0, None, "wrong-id", 0.01)
+    proposal = MagicMock()
+    proposal.candidates = [text_hit, fp_hit]
+    proposal.recommendation = Recommendation.none
+
+    with (
+        patch("src.beets_svc.Item.from_path", return_value=MagicMock()),
+        patch("src.beets_svc._fingerprint_item", return_value={"fp-id"}),
+        patch("src.beets_svc.tag_item", return_value=proposal),
+    ):
+        result = _get_candidates_sync(audio)
+
+    assert [c.mb_track_id for c in result.candidates] == ["fp-id"]
+    assert result.fingerprinted is True
+    assert result.recommendation == Recommendation.strong
 
 
 def _mk_apply_mocks(dest, *, rec=None, track_data=None, artist="half·alive"):

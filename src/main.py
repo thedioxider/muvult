@@ -13,13 +13,14 @@ from .db import init_db
 from .handlers.admin import admin_router
 from .handlers.upload import upload_router
 from .handlers.user import user_router
+from .tg_utils import FloodControlMiddleware
 
 logging.basicConfig(level=logging.INFO)
 
 
 async def main() -> None:
     await init_db()
-    setup_beets(settings.music_root, settings.mb_search_limit)
+    setup_beets(settings.music_root, settings.mb_search_limit, settings.acoustid_api_key)
 
     session = None
     if settings.bot_api_url:
@@ -27,6 +28,7 @@ async def main() -> None:
             api=TelegramAPIServer.from_base(settings.bot_api_url, is_local=settings.bot_api_local)
         )
     bot = Bot(token=settings.bot_token, session=session)
+    bot.session.middleware(FloodControlMiddleware())  # wait out 429s instead of going silent
     dp = Dispatcher(storage=MemoryStorage())
 
     dp.update.middleware(AuthMiddleware())

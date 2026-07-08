@@ -12,10 +12,20 @@ from aiogram import Bot, Router
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from sqlmodel import select
 
-from ..beets_svc import get_candidates, apply_and_stage, stage_as_is, normalize_title
+from beets.autotag.match import Recommendation
+
+from ..beets_svc import get_candidates, apply_and_stage, stage_as_is, normalize_title, fetch_cover_art_full
 from ..db import Track, TrackOwnership, User, get_session
 from ..models import ConfirmationMode, FileStatus, TagResult
-from ..pool import create_symlink, pool_rel, promote_pool_file, remove_pool_file, update_symlinks
+from ..pool import (
+    create_symlink,
+    ensure_cover_symlink,
+    find_cover,
+    pool_rel,
+    promote_pool_file,
+    remove_pool_file,
+    update_symlinks,
+)
 from ..quality import is_better
 from ..tg_utils import safe_answer
 
@@ -53,6 +63,33 @@ class _UserBatch:
 _user_batches: dict[int, _UserBatch] = {}
 _batch_locks: dict[int, asyncio.Lock] = {}
 _batch_debounce_tasks: dict[int, asyncio.Task] = {}
+
+# Live status edits are throttled. Editing on *every* file transition spends a
+# Telegram per-chat rate-limit token per edit -- edits share the same
+# burst-tolerant ~1 msg/s per-chat bucket as sends/deletes -- and a multi-track
+# upload's transitions burst well past that, tripping flood control (429), which
+# silently froze the status message mid-upload while the imports themselves kept
+# going. Instead each transition marks its partition dirty and one per-user
+# worker coalesces them into at most one edit per partition per
+# _STATUS_THROTTLE_SECONDS, always rendering the *latest* state (so the terminal
+# state still lands) and skipping the edit when the text hasn't changed. Flush
+# resends and confirmation prompts are deliberately left alone -- resends are
+# rare (once per debounce settle) and prompts are paced by the user's clicks.
+_STATUS_THROTTLE_SECONDS = 2.0
+_status_dirty: dict[int, set[int]] = {}  # tg_id -> dirty partition indices
+_status_workers: dict[int, asyncio.Task] = {}
+_status_last_text: dict[tuple[int, int], str] = {}  # (tg_id, idx) -> last rendered text
+
+# Confirmation prompts share the same per-chat bucket: each answered prompt fires
+# a delete (of the answered one) plus a send (of the next), and a fast clicker
+# can burst these past the limit. Consecutive prompt *sends* are paced
+# dynamically -- the wait is measured against how long the user spent on the
+# previous prompt, so a long deliberation adds only _PROMPT_MIN_HOLD_SECONDS (just
+# enough to separate the delete from the next send), while a quick answer waits
+# out the rest of _PROMPT_THROTTLE_SECONDS. Prompts stay one-message-per-file
+# (sent fresh, deleted on answer) so it's always clear the previous was answered.
+_PROMPT_THROTTLE_SECONDS = 1.0  # target minimum spacing between consecutive prompt sends
+_PROMPT_MIN_HOLD_SECONDS = 0.5  # floor pause after an answer before the next prompt
 
 
 def _get_batch_lock(tg_id: int) -> asyncio.Lock:
@@ -97,25 +134,92 @@ def _maybe_close_batch(tg_id: int, batch: _UserBatch) -> None:
     all_done = all(fs.status in _TERMINAL for fs in batch.states.values())
     task = _batch_debounce_tasks.get(tg_id)
     timer_pending = task is not None and not task.done()
-    if all_done and not timer_pending and _user_batches.get(tg_id) is batch:
+    worker = _status_workers.get(tg_id)
+    worker_pending = worker is not None and not worker.done()
+    # Don't close while a throttled status edit is still queued -- the batch must
+    # survive until its final (terminal) state has actually been rendered.
+    if all_done and not timer_pending and not worker_pending and _user_batches.get(tg_id) is batch:
         _user_batches.pop(tg_id, None)
+        _status_dirty.pop(tg_id, None)
+        for key in [k for k in _status_last_text if k[0] == tg_id]:
+            _status_last_text.pop(key, None)
 
 
 async def _report_batch_status(bot: Bot, tg_id: int, file_id: str) -> None:
+    """Mark a file's partition dirty and ensure a throttled edit worker is running.
+
+    Editing here directly, on every transition, floods the per-chat rate limit
+    (see the _STATUS_THROTTLE_SECONDS note above); instead the actual edit is
+    coalesced and rate-limited by _drain_status_updates.
+    """
     async with _get_batch_lock(tg_id):
         batch = _user_batches.get(tg_id)
         if batch is None or file_id not in batch.position:
             return
         idx = batch.position[file_id]
-        if idx < len(batch.message_ids):
-            text = _format_status_message(_partition_states(batch, idx))
-            try:
-                await bot.edit_message_text(
-                    text, chat_id=batch.chat_id, message_id=batch.message_ids[idx], parse_mode="HTML"
-                )
-            except Exception:
-                pass
-        _maybe_close_batch(tg_id, batch)
+    _status_dirty.setdefault(tg_id, set()).add(idx)
+    if tg_id not in _status_workers or _status_workers[tg_id].done():
+        _status_workers[tg_id] = asyncio.create_task(_drain_status_updates(bot, tg_id))
+
+
+async def _drain_status_updates(bot: Bot, tg_id: int) -> None:
+    """Coalesce pending status edits into at most one edit per throttle window.
+
+    Handles *one* dirty partition per pass (lowest index first), rendering its
+    *current* state -- so the latest transition always wins, the terminal state
+    lands even if it arrived mid-sleep, and a multi-message batch's partitions
+    take turns rather than bursting several edits into one window. A partition
+    whose text is unchanged is dropped without an edit or a wait (costs no
+    rate-limit token); only an edit that actually goes out is followed by the
+    throttle sleep. Exits when nothing is dirty, re-arming if a transition
+    slipped in during the final pass, and closes the batch once fully drained.
+    """
+    try:
+        while _status_dirty.get(tg_id):
+            async with _get_batch_lock(tg_id):
+                dirty = _status_dirty.get(tg_id)
+                if not dirty:
+                    break
+                idx = min(dirty)  # round-robin by index; finite transitions drain them all
+                dirty.discard(idx)
+                if not dirty:
+                    _status_dirty.pop(tg_id, None)
+                batch = _user_batches.get(tg_id)
+                if batch is None:
+                    return
+                edited = await _render_partition(bot, tg_id, batch, idx)
+            if edited:
+                await asyncio.sleep(_STATUS_THROTTLE_SECONDS)
+    finally:
+        _status_workers.pop(tg_id, None)
+        if _status_dirty.get(tg_id):  # a transition arrived during the final pass
+            _status_workers[tg_id] = asyncio.create_task(_drain_status_updates(bot, tg_id))
+            return
+        async with _get_batch_lock(tg_id):
+            batch = _user_batches.get(tg_id)
+            if batch is not None:
+                _maybe_close_batch(tg_id, batch)
+
+
+async def _render_partition(bot: Bot, tg_id: int, batch: _UserBatch, idx: int) -> bool:
+    """Edit one partition's message to its current state; caller holds the lock.
+
+    Returns whether an edit was actually sent -- an unchanged render is skipped
+    so it neither spends a rate-limit token nor triggers the throttle wait.
+    """
+    if idx >= len(batch.message_ids):
+        return False
+    text = _format_status_message(_partition_states(batch, idx))
+    if _status_last_text.get((tg_id, idx)) == text:
+        return False
+    try:
+        await bot.edit_message_text(
+            text, chat_id=batch.chat_id, message_id=batch.message_ids[idx], parse_mode="HTML"
+        )
+        _status_last_text[(tg_id, idx)] = text
+        return True
+    except Exception:
+        return False
 
 
 async def _flush_user_batch(bot: Bot, tg_id: int, chat_id: int) -> None:
@@ -137,6 +241,7 @@ async def _flush_user_batch(bot: Bot, tg_id: int, chat_id: int) -> None:
             text = _format_status_message(_partition_states(batch, idx))
             msg = await bot.send_message(chat_id, text, parse_mode="HTML")
             batch.message_ids.append(msg.message_id)
+            _status_last_text[(tg_id, idx)] = text  # keep the throttle's cache in step with what's on screen
         batch.chat_id = chat_id
         _batch_debounce_tasks.pop(tg_id, None)
         _maybe_close_batch(tg_id, batch)
@@ -185,6 +290,59 @@ async def _find_existing_track(session, mb_id: str | None, pool_path: str):
             return existing
     result = await session.exec(select(Track).where(Track.pool_path == pool_path))
     return result.first()
+
+
+async def _album_owner_usernames(session, rel_album: str) -> list[str]:
+    """Usernames of every user owning any track in the given album folder.
+
+    ``rel_album`` is the album dir relative to the pool root (``<albumartist>/
+    <album>``); tracks are matched by that path prefix. Drives the cover fan-out
+    so a newly-created album cover is linked into all current owners' libraries."""
+    prefix = rel_album + "/"
+    tracks = (
+        await session.exec(select(Track).where(Track.pool_path.startswith(prefix, autoescape=True)))
+    ).all()
+    track_ids = [t.id for t in tracks]
+    if not track_ids:
+        return []
+    owns = (
+        await session.exec(select(TrackOwnership).where(TrackOwnership.track_id.in_(track_ids)))
+    ).all()
+    user_ids = {o.user_id for o in owns}
+    if not user_ids:
+        return []
+    users = (await session.exec(select(User).where(User.id.in_(user_ids)))).all()
+    return [u.username for u in users]
+
+
+async def _ensure_album_cover(rgid: str, pool_file: Path) -> None:
+    """Fetch (once) and link the album's full-res folder cover into every owner.
+
+    The pool holds one real ``front.<ext>`` per album (fetched from the CAA on
+    first need); each owner's album folder gets a relative symlink to it, which
+    Navidrome prefers over the embedded 500px art. Fanning out to *all* current
+    owners -- not just the uploader -- means a user who imported the album while
+    art was missing gets covered the moment anyone re-triggers the fetch. Every
+    step is idempotent, so duplicates and re-uploads self-heal missing links."""
+    from ..config import settings
+
+    music_root = Path(settings.music_root)
+    album_dir = pool_file.parent
+    rel_album = str(Path(pool_rel(pool_file)).parent)
+    cover = find_cover(album_dir)
+    if cover is None:
+        result = await fetch_cover_art_full(rgid)
+        if result is None:
+            return
+        data, ext = result
+        cover = find_cover(album_dir)  # re-check: a concurrent import may have won
+        if cover is None:
+            cover = album_dir / f"front{ext}"
+            cover.write_bytes(data)
+    async with get_session() as session:
+        usernames = await _album_owner_usernames(session, rel_album)
+    for uname in usernames:
+        ensure_cover_symlink(cover, music_root / uname / rel_album)
 
 
 def _top_twins(candidates: list) -> list:
@@ -373,7 +531,7 @@ async def _ask_confirmation(bot: Bot, tg_id: int, req: "_ConfirmationRequest") -
             InlineKeyboardButton(text="Skip", callback_data=f"conf{_CB_SEP}skip"),
         ]]
         text = f"❌ No matches found for:\n<i>{fname}</i>"
-    elif tag.recommendation >= 3:
+    elif tag.recommendation >= Recommendation.strong:
         c = tag.candidates[0]
         artist = html.escape(c.artist)
         title = html.escape(c.title)
@@ -422,10 +580,17 @@ async def _process_file(
         states[file_id] = FileState(filename, FileStatus.DOWNLOADING)
         await report()
         await bot.download(file_id, destination=file_path)
+        log.info("received %r (tg_id=%s, %d bytes)", filename, tg_id, file_path.stat().st_size)
 
         states[file_id].status = FileStatus.TAGGING
         await report()
         tag_result = await get_candidates(file_path)
+        log.info(
+            "tagged %r: %s, %d candidate(s)", filename,
+            "fingerprint" if tag_result.fingerprinted
+            else "search" if tag_result.candidates else "no match",
+            len(tag_result.candidates),
+        )
 
         async with get_session() as session:
             result = await session.exec(select(User).where(User.tg_id == tg_id))
@@ -434,25 +599,31 @@ async def _process_file(
         mode = ConfirmationMode(user_settings.get("confirmation", "auto"))
         enrich = user_settings.get("enrich", True)
 
-        is_high = tag_result.recommendation >= 3
+        is_high = tag_result.recommendation >= Recommendation.strong
         chosen_index: int | str | None = None
 
         if mode == ConfirmationMode.OFF:
             chosen_index = 0 if (is_high and tag_result.candidates) else "asis"
         elif mode == ConfirmationMode.AUTO and is_high and tag_result.candidates:
-            twins = _top_twins(tag_result.candidates)
-            if len(twins) == 1:
+            # On the fingerprint path the whole candidate set already *is* the
+            # ambiguity (every entry is an audio match), so any leftover after
+            # dedup means "prompt". On the text path we instead reconstruct which
+            # recordings hide behind the top pick via same-artist+title twins.
+            group = (
+                tag_result.candidates
+                if tag_result.fingerprinted
+                else _top_twins(tag_result.candidates)
+            )
+            if len(group) == 1:
                 chosen_index = 0  # unique high-confidence match: import without asking
             else:
-                # High confidence, but candidate #0 has same-artist+title twins that
-                # dedup kept apart by disambiguation (a live take, a radio edit, ...).
-                # We can't tell which the user meant, so prompt -- but only among the
-                # twins, not the whole list. The buttons carry each candidate's
-                # original .index (its position in the full list), so the int result
-                # still resolves against tag_result.candidates below.
+                # Ambiguous: prompt, but only among this group, not the whole list.
+                # The buttons carry each candidate's original .index (its position
+                # in the full list), so the int result still resolves against
+                # tag_result.candidates below.
                 chosen_index = await _queue_confirmation(
                     bot, tg_id, file_id, filename,
-                    TagResult(candidates=twins, recommendation=0),
+                    TagResult(candidates=group, recommendation=Recommendation.none),
                     file_path, states, report,
                 )
         else:
@@ -460,10 +631,11 @@ async def _process_file(
                 chosen_index = await _queue_confirmation(bot, tg_id, file_id, filename, tag_result, file_path, states, report)
                 if chosen_index != "list":
                     break
-                tag_result.recommendation = 0
+                tag_result.recommendation = Recommendation.none
 
         if chosen_index is None:
             states[file_id] = FileState(filename, FileStatus.SKIPPED)
+            log.info("skipped %r (tg_id=%s): no selection", filename, tg_id)
             await report()
             return
 
@@ -477,10 +649,14 @@ async def _process_file(
             mb_id = candidate.mb_track_id
 
         from beets import mediafile as mf_lib
+        rgid = None
         try:
             mf = mf_lib.MediaFile(str(staged))
             new_bitrate = mf.bitrate // 1000 if mf.bitrate else 0
             new_format = staged.suffix.lstrip(".")
+            # Set only when enrichment resolved a release group; drives the folder
+            # cover. None for as-is/unenriched imports -> no folder cover.
+            rgid = (mf.mb_releasegroupid or None) if not is_asis else None
         except Exception:
             new_bitrate, new_format = 0, staged.suffix.lstrip(".")
 
@@ -550,10 +726,24 @@ async def _process_file(
                 session.add(TrackOwnership(track_id=track_id, user_id=user_id, symlink_path=str(symlink)))
             await session.commit()
 
+        # Folder cover art, outside the pool lock (network fetch; keeps the
+        # critical section tight). Best-effort: never fails an otherwise-good
+        # import. Idempotent -- safe on duplicates, which self-heal a missing link.
+        if rgid:
+            try:
+                await _ensure_album_cover(rgid, pool_file)
+            except Exception:
+                log.debug("cover art linking failed for %s", pool_rel(pool_file))
+
         if already_owned:
             states[file_id] = FileState(filename, FileStatus.DUPLICATE)
+            log.info("duplicate %r (user=%s): already owns %s",
+                     filename, db_user.username, pool_rel(pool_file))
         else:
             states[file_id] = FileState(filename, FileStatus.IMPORTED, note)
+            action = "as-is" if is_asis else "upgraded" if note else "imported"
+            log.info("%s %r (user=%s) -> %s",
+                     action, filename, db_user.username, pool_rel(pool_file))
         await report()
 
     except Exception as e:
@@ -597,13 +787,22 @@ async def _queue_confirmation(
 
 async def _drain_confirmation_queue(bot: Bot, tg_id: int) -> None:
     q = _confirmation_queues.get(tg_id)
+    loop = get_running_loop()
+    last_sent = 0.0  # monotonic time the previous prompt was sent (0 => none yet)
     try:
         while q and not q.empty():
             req: _ConfirmationRequest = await q.get()
             if not req.future.done():
+                if last_sent:
+                    # Pace the next send against how long the user spent on the
+                    # last prompt: a quick answer waits out the rest of the
+                    # throttle window, a slow one only the floor hold.
+                    wait = max(_PROMPT_MIN_HOLD_SECONDS, _PROMPT_THROTTLE_SECONDS - (loop.time() - last_sent))
+                    await asyncio.sleep(wait)
                 _active_confirmations[tg_id] = req
                 try:
                     await _ask_confirmation(bot, tg_id, req)
+                    last_sent = loop.time()
                     await req.future
                 except Exception as e:
                     if not req.future.done():

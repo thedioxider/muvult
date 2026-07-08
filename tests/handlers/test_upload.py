@@ -1,10 +1,19 @@
 import asyncio
+from pathlib import Path
 import pytest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 from src.handlers import upload
-from src.handlers.upload import _format_status_message, FileState, _find_existing_track, _top_twins
+from src.handlers.upload import (
+    _format_status_message,
+    FileState,
+    _find_existing_track,
+    _top_twins,
+    _album_owner_usernames,
+    _ensure_album_cover,
+)
 from src.models import Candidate, FileStatus
-from src.db import init_db, get_session, Track
+from src.db import init_db, get_session, Track, TrackOwnership, User
+from src.pool import create_symlink, find_cover
 
 
 def _c(index, artist, title, disambig=None):
@@ -217,6 +226,100 @@ async def test_find_existing_returns_none_when_neither_matches(tmp_path):
         assert await _find_existing_track(s, "rec-Z", "z/z.mp3") is None
 
 
+def _album_fixture(tmp_path):
+    """Two users each owning one track of Artist/Album, with real track symlinks.
+
+    Returns (music_root, pool_file, {username: album_dir}). Mirrors how upload
+    lays out the pool + per-user symlink libraries."""
+    music_root = tmp_path / "music"
+    pool_dir = music_root / ".pool" / "Artist" / "Album"
+    pool_dir.mkdir(parents=True)
+    album_dirs = {}
+    for uname, fname in (("alice", "01 - A.mp3"), ("bob", "02 - B.mp3")):
+        pool_file = pool_dir / fname
+        pool_file.write_bytes(b"audio")
+        link = create_symlink(pool_file, music_root / uname)
+        album_dirs[uname] = link.parent
+    return music_root, pool_dir, album_dirs
+
+
+async def _seed_owners(album_rel="Artist/Album"):
+    """alice+bob own one track each in the album; carol owns an unrelated one."""
+    async with get_session() as s:
+        for i, uname in enumerate(("alice", "bob", "carol"), start=1):
+            s.add(User(id=i, tg_id=i, username=uname, navidrome_user_id=str(i), navidrome_library_id=i))
+        s.add(Track(id=1, pool_path=f"{album_rel}/01 - A.mp3", format="mp3", bitrate=320))
+        s.add(Track(id=2, pool_path=f"{album_rel}/02 - B.mp3", format="mp3", bitrate=320))
+        s.add(Track(id=3, pool_path="Other/Thing/09 - z.mp3", format="mp3", bitrate=320))
+        await s.flush()  # parents before ownerships (foreign_keys=ON)
+        s.add(TrackOwnership(track_id=1, user_id=1, symlink_path="/x/alice"))
+        s.add(TrackOwnership(track_id=2, user_id=2, symlink_path="/x/bob"))
+        s.add(TrackOwnership(track_id=3, user_id=3, symlink_path="/x/carol"))
+        await s.commit()
+
+
+@pytest.mark.asyncio
+async def test_album_owner_usernames_collects_only_album_owners(tmp_path):
+    await init_db(str(tmp_path / "db"))
+    await _seed_owners()
+    async with get_session() as s:
+        names = await _album_owner_usernames(s, "Artist/Album")
+    assert set(names) == {"alice", "bob"}  # carol's unrelated album excluded
+
+
+@pytest.mark.asyncio
+async def test_ensure_album_cover_fetches_once_and_fans_out(tmp_path):
+    await init_db(str(tmp_path / "db"))
+    await _seed_owners()
+    music_root, pool_dir, album_dirs = _album_fixture(tmp_path)
+    pool_file = pool_dir / "01 - A.mp3"
+
+    fetch = AsyncMock(return_value=(b"IMGDATA", ".png"))
+    with patch("src.config.settings", MagicMock(music_root=str(music_root))), \
+         patch("src.handlers.upload.fetch_cover_art_full", fetch):
+        await _ensure_album_cover("rg-1", pool_file)
+
+    fetch.assert_awaited_once_with("rg-1")
+    pool_cover = pool_dir / "front.png"
+    assert pool_cover.read_bytes() == b"IMGDATA"
+    # every owner of the album got a symlink to the pool cover
+    for uname in ("alice", "bob"):
+        link = album_dirs[uname] / "front.png"
+        assert link.is_symlink() and link.resolve() == pool_cover.resolve()
+
+
+@pytest.mark.asyncio
+async def test_ensure_album_cover_skips_fetch_when_pool_cover_exists(tmp_path):
+    await init_db(str(tmp_path / "db"))
+    await _seed_owners()
+    music_root, pool_dir, album_dirs = _album_fixture(tmp_path)
+    pool_file = pool_dir / "01 - A.mp3"
+    (pool_dir / "front.jpg").write_bytes(b"EXISTING")  # already fetched earlier
+
+    fetch = AsyncMock()
+    with patch("src.config.settings", MagicMock(music_root=str(music_root))), \
+         patch("src.handlers.upload.fetch_cover_art_full", fetch):
+        await _ensure_album_cover("rg-1", pool_file)
+
+    fetch.assert_not_awaited()  # no refetch when a cover is already present
+    assert find_cover(album_dirs["alice"]) == album_dirs["alice"] / "front.jpg"
+
+
+@pytest.mark.asyncio
+async def test_ensure_album_cover_noop_when_fetch_fails(tmp_path):
+    await init_db(str(tmp_path / "db"))
+    await _seed_owners()
+    music_root, pool_dir, album_dirs = _album_fixture(tmp_path)
+    pool_file = pool_dir / "01 - A.mp3"
+
+    with patch("src.config.settings", MagicMock(music_root=str(music_root))), \
+         patch("src.handlers.upload.fetch_cover_art_full", AsyncMock(return_value=None)):
+        await _ensure_album_cover("rg-1", pool_file)
+
+    assert find_cover(pool_dir) is None  # nothing written
+    assert find_cover(album_dirs["alice"]) is None  # nothing linked
+
+
 @pytest.mark.asyncio
 async def test_find_existing_by_pool_path_for_as_is(tmp_path):
     # As-is imports carry no recording id and must match on pool_path alone.
@@ -279,7 +382,8 @@ def test_partition_states_filters_by_index():
 
 
 @pytest.mark.asyncio
-async def test_report_batch_status_edits_only_own_partition():
+async def test_report_batch_status_edits_only_own_partition(monkeypatch):
+    monkeypatch.setattr(upload, "_STATUS_THROTTLE_SECONDS", 0)
     tg_id = 90001
     batch = upload._UserBatch()
     batch.states = {
@@ -293,6 +397,7 @@ async def test_report_batch_status_edits_only_own_partition():
 
     bot = AsyncMock()
     await upload._report_batch_status(bot, tg_id, "a")
+    await upload._status_workers[tg_id]  # drive the throttled edit worker to completion
 
     bot.edit_message_text.assert_awaited_once()
     _, kwargs = bot.edit_message_text.call_args
@@ -301,10 +406,12 @@ async def test_report_batch_status_edits_only_own_partition():
     # "b" isn't terminal yet, so the batch must still be open.
     assert tg_id in upload._user_batches
     upload._user_batches.pop(tg_id, None)
+    upload._status_last_text.clear()
 
 
 @pytest.mark.asyncio
-async def test_report_batch_status_closes_when_all_terminal():
+async def test_report_batch_status_closes_when_all_terminal(monkeypatch):
+    monkeypatch.setattr(upload, "_STATUS_THROTTLE_SECONDS", 0)
     tg_id = 90002
     batch = upload._UserBatch()
     batch.states = {"a": FileState("a.mp3", FileStatus.IMPORTED)}
@@ -315,8 +422,88 @@ async def test_report_batch_status_closes_when_all_terminal():
 
     bot = AsyncMock()
     await upload._report_batch_status(bot, tg_id, "a")
+    await upload._status_workers[tg_id]
 
     assert tg_id not in upload._user_batches
+    upload._status_last_text.clear()
+
+
+@pytest.mark.asyncio
+async def test_status_updates_are_coalesced_and_skip_unchanged(monkeypatch):
+    # Rapid transitions on one partition collapse to far fewer edits than
+    # transitions, and an unchanged render never spends an edit at all.
+    monkeypatch.setattr(upload, "_STATUS_THROTTLE_SECONDS", 0.05)
+    tg_id = 90005
+    batch = upload._UserBatch()
+    batch.states = {"a": FileState("a.mp3", FileStatus.DOWNLOADING)}
+    batch.position = {"a": 0}
+    batch.message_ids = [10]
+    batch.chat_id = 999
+    upload._user_batches[tg_id] = batch
+
+    bot = AsyncMock()
+    for st in (FileStatus.DOWNLOADING, FileStatus.TAGGING, FileStatus.PENDING, FileStatus.IMPORTED):
+        batch.states["a"].status = st
+        await upload._report_batch_status(bot, tg_id, "a")
+    await upload._status_workers[tg_id]
+
+    # Four transitions, but coalesced into at most two edits (never one-per-tick).
+    assert 1 <= bot.edit_message_text.await_count <= 2
+    # Terminal state landed and the batch closed.
+    assert tg_id not in upload._user_batches
+    upload._status_last_text.clear()
+
+
+@pytest.mark.asyncio
+async def test_multi_partition_edits_are_spaced_one_per_window(monkeypatch):
+    # A multi-message batch must not burst every dirty partition into one window:
+    # the worker edits one partition per throttle sleep, round-robin.
+    sleeps: list[float] = []
+
+    async def fake_sleep(s):
+        sleeps.append(s)
+
+    monkeypatch.setattr(upload.asyncio, "sleep", fake_sleep)
+    tg_id = 90006
+    batch = upload._UserBatch()
+    batch.states = {
+        "a": FileState("a.mp3", FileStatus.IMPORTED),
+        "b": FileState("b.mp3", FileStatus.IMPORTED),
+    }
+    batch.position = {"a": 0, "b": 1}
+    batch.message_ids = [10, 20]
+    batch.chat_id = 999
+    upload._user_batches[tg_id] = batch
+
+    bot = AsyncMock()
+    await upload._report_batch_status(bot, tg_id, "a")
+    await upload._report_batch_status(bot, tg_id, "b")
+    await upload._status_workers[tg_id]
+
+    # Both partitions edited (their own message), each followed by its own window.
+    edited_msgs = {kw["message_id"] for _, kw in bot.edit_message_text.call_args_list}
+    assert edited_msgs == {10, 20}
+    assert len(sleeps) == 2  # one throttle window per edit -- not both in a single burst
+    upload._user_batches.pop(tg_id, None)
+    upload._status_last_text.clear()
+
+
+@pytest.mark.asyncio
+async def test_prompt_throttle_waits_longer_after_a_fast_answer(monkeypatch):
+    # The pace between consecutive prompt sends shrinks the longer the user spent
+    # on the previous prompt: a fast answer waits ~the full window, a slow answer
+    # only the floor hold.
+    monkeypatch.setattr(upload, "_PROMPT_THROTTLE_SECONDS", 1.0)
+    monkeypatch.setattr(upload, "_PROMPT_MIN_HOLD_SECONDS", 0.1)
+    loop = asyncio.get_running_loop()
+
+    def wait_after(think: float) -> float:
+        last_sent = loop.time() - think  # user spent `think` seconds on the last prompt
+        return max(upload._PROMPT_MIN_HOLD_SECONDS, upload._PROMPT_THROTTLE_SECONDS - (loop.time() - last_sent))
+
+    assert wait_after(0.0) == pytest.approx(1.0, abs=0.05)   # instant click -> full window
+    assert wait_after(0.6) == pytest.approx(0.4, abs=0.05)   # partial think -> remainder
+    assert wait_after(5.0) == upload._PROMPT_MIN_HOLD_SECONDS  # long think -> just the floor
 
 
 @pytest.mark.asyncio

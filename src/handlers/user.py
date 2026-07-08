@@ -101,7 +101,7 @@ async def cmd_settings(message: Message) -> None:
         "  — off: don't ask anything\n"
         "  — auto: ask only when no exact matches found\n"
         "  — on: ask even if exact match is found\n\n"
-        "Album metadata fetch (album, track number, disc, year):\n"
+        "Album metadata fetch (album, track number, disc, year, cover art):\n"
         "  — off: faster, tags title and artist only\n"
         "  — on: slower, adds a MusicBrainz lookup per track",
         reply_markup=keyboard
