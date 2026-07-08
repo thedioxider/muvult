@@ -245,7 +245,21 @@ def test_format_status_omits_empty_groups():
 
 
 @pytest.mark.asyncio
-async def test_find_existing_prefers_recording_id(tmp_path):
+async def test_find_existing_matches_by_pool_path(tmp_path):
+    # The path is occupied by a row under a *different* recording id (arrow
+    # re-tagged from 05ed7f3c to 86349be4). Path is primary, so we adopt that row
+    # instead of inserting a duplicate that violates the unique path.
+    await init_db(str(tmp_path / "db"))
+    async with get_session() as s:
+        s.add(Track(pool_path="a/b/7 - arrow.mp3", musicbrainz_id="05ed7f3c", format="mp3", bitrate=320))
+        await s.commit()
+        found = await _find_existing_track(s, "86349be4", "a/b/7 - arrow.mp3")
+        assert found is not None and found.musicbrainz_id == "05ed7f3c"
+
+
+@pytest.mark.asyncio
+async def test_find_existing_falls_back_to_recording_id(tmp_path):
+    # No row holds the path -> fall back to the recording id.
     await init_db(str(tmp_path / "db"))
     async with get_session() as s:
         s.add(Track(pool_path="a/b/1 - x.mp3", musicbrainz_id="rec-A", format="mp3", bitrate=320))
@@ -255,16 +269,15 @@ async def test_find_existing_prefers_recording_id(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_find_existing_falls_back_to_pool_path_on_new_recording(tmp_path):
-    # The collision case: the path is occupied by a row under a *different*
-    # recording id (arrow re-tagged from 05ed7f3c to 86349be4). We must adopt that
-    # row via pool_path, not insert a duplicate that violates the unique path.
+async def test_find_existing_prefers_pool_path_over_recording_id(tmp_path):
+    # Path and mbid point at different rows: path wins.
     await init_db(str(tmp_path / "db"))
     async with get_session() as s:
-        s.add(Track(pool_path="a/b/7 - arrow.mp3", musicbrainz_id="05ed7f3c", format="mp3", bitrate=320))
+        s.add(Track(pool_path="p1", musicbrainz_id="rec-A", format="mp3", bitrate=320))
+        s.add(Track(pool_path="p2", musicbrainz_id="rec-B", format="mp3", bitrate=320))
         await s.commit()
-        found = await _find_existing_track(s, "86349be4", "a/b/7 - arrow.mp3")
-        assert found is not None and found.musicbrainz_id == "05ed7f3c"
+        found = await _find_existing_track(s, "rec-A", "p2")
+        assert found is not None and found.musicbrainz_id == "rec-B"
 
 
 @pytest.mark.asyncio

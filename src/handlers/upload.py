@@ -290,20 +290,21 @@ _TERMINAL = {FileStatus.IMPORTED, FileStatus.SKIPPED, FileStatus.DUPLICATE, File
 async def _find_existing_track(session, mb_id: str | None, pool_path: str):
     """Locate the Track a staged upload maps onto.
 
-    Prefer the recording id; fall back to the canonical pool path. A re-upload that
-    now resolves to a *different* recording id (e.g. after a better MB match) still
-    lands on the row already occupying its path -- which is unique -- so we replace
-    that row in place instead of inserting a duplicate that would collide. Because
-    the path carries the track disambiguation, a genuinely different recording of
-    the same track (a live take) resolves to a different path and never adopts the
-    wrong row.
+    Match on the canonical pool path first -- it's the unique key and where the
+    file actually lives, so a row already occupying it *is* this track (adopt it in
+    place rather than inserting a duplicate that would collide on the unique path).
+    The path carries the track disambiguation, so a genuinely different recording
+    of the same track (a live take) resolves to a different path and never adopts
+    the wrong row. Only if no row holds the path do we fall back to the recording
+    id, which catches the same recording previously filed under a different path.
     """
+    result = await session.exec(select(Track).where(Track.pool_path == pool_path))
+    if (existing := result.first()) is not None:
+        return existing
     if mb_id:
         result = await session.exec(select(Track).where(Track.musicbrainz_id == mb_id))
-        if (existing := result.first()) is not None:
-            return existing
-    result = await session.exec(select(Track).where(Track.pool_path == pool_path))
-    return result.first()
+        return result.first()
+    return None
 
 
 async def _album_owner_usernames(session, rel_album: str) -> list[str]:
