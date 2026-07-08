@@ -276,3 +276,33 @@ def test_patch_acoustid_lookup_is_idempotent():
     assert getattr(acoustid.lookup, "_muvult_retry", False) is True
     patch_acoustid_lookup()
     assert acoustid.lookup is first  # not double-wrapped
+
+
+def test_patch_acoustid_lookup_captures_top_cluster_score(monkeypatch):
+    import acoustid
+
+    from src import beets_patches
+    from src.beets_patches import (
+        last_fingerprint_score,
+        patch_acoustid_lookup,
+        reset_fingerprint_score,
+    )
+
+    patch_acoustid_lookup()
+    reset_fingerprint_score()
+
+    # The wrapper stashes results[0]["score"] from the raw response.
+    monkeypatch.setattr(
+        beets_patches, "_acoustid_lookup_with_retry",
+        lambda fn, *a, **k: {"status": "ok", "results": [{"score": 0.87}, {"score": 0.1}]},
+    )
+    acoustid.lookup("key", "fp", 100)
+    assert last_fingerprint_score() == pytest.approx(0.87)
+
+    # A no-result / malformed response leaves the score cleared.
+    monkeypatch.setattr(
+        beets_patches, "_acoustid_lookup_with_retry",
+        lambda fn, *a, **k: {"status": "ok", "results": []},
+    )
+    acoustid.lookup("key", "fp", 100)
+    assert last_fingerprint_score() is None

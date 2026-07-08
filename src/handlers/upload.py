@@ -16,7 +16,7 @@ from beets.autotag.match import Recommendation
 
 from ..beets_svc import get_candidates, apply_and_stage, stage_as_is, normalize_title, fetch_cover_art_full
 from ..db import Track, TrackOwnership, User, get_session
-from ..models import ConfirmationMode, FileStatus, TagResult
+from ..models import Candidate, ConfirmationMode, FileStatus, TagResult
 from ..pool import (
     create_symlink,
     ensure_cover_symlink,
@@ -90,6 +90,12 @@ _status_last_text: dict[tuple[int, int], str] = {}  # (tg_id, idx) -> last rende
 # (sent fresh, deleted on answer) so it's always clear the previous was answered.
 _PROMPT_THROTTLE_SECONDS = 1.0  # target minimum spacing between consecutive prompt sends
 _PROMPT_MIN_HOLD_SECONDS = 0.5  # floor pause after an answer before the next prompt
+
+# Combined-confidence bar a fingerprint match must clear to be trusted without a
+# human look. In AUTO a lone match at/above it auto-imports (below it prompts); in
+# OFF a match at/above it is picked outright, and below it we fall back to beets'
+# text search (the fingerprint is deemed too weak to be authoritative).
+_FP_CONFIDENCE_THRESHOLD = 0.80
 
 
 def _get_batch_lock(tg_id: int) -> asyncio.Lock:
@@ -284,20 +290,21 @@ _TERMINAL = {FileStatus.IMPORTED, FileStatus.SKIPPED, FileStatus.DUPLICATE, File
 async def _find_existing_track(session, mb_id: str | None, pool_path: str):
     """Locate the Track a staged upload maps onto.
 
-    Prefer the recording id; fall back to the canonical pool path. A re-upload that
-    now resolves to a *different* recording id (e.g. after a better MB match) still
-    lands on the row already occupying its path -- which is unique -- so we replace
-    that row in place instead of inserting a duplicate that would collide. Because
-    the path carries the track disambiguation, a genuinely different recording of
-    the same track (a live take) resolves to a different path and never adopts the
-    wrong row.
+    Match on the canonical pool path first -- it's the unique key and where the
+    file actually lives, so a row already occupying it *is* this track (adopt it in
+    place rather than inserting a duplicate that would collide on the unique path).
+    The path carries the track disambiguation, so a genuinely different recording
+    of the same track (a live take) resolves to a different path and never adopts
+    the wrong row. Only if no row holds the path do we fall back to the recording
+    id, which catches the same recording previously filed under a different path.
     """
+    result = await session.exec(select(Track).where(Track.pool_path == pool_path))
+    if (existing := result.first()) is not None:
+        return existing
     if mb_id:
         result = await session.exec(select(Track).where(Track.musicbrainz_id == mb_id))
-        if (existing := result.first()) is not None:
-            return existing
-    result = await session.exec(select(Track).where(Track.pool_path == pool_path))
-    return result.first()
+        return result.first()
+    return None
 
 
 async def _album_owner_usernames(session, rel_album: str) -> list[str]:
@@ -374,6 +381,51 @@ def _top_twins(candidates: list) -> list:
         c for c in candidates
         if (c.artist.lower(), normalize_title(c.title, loose=True)) == key
     ]
+
+
+def _reindexed(candidates: list[Candidate]) -> list[Candidate]:
+    """Copies of ``candidates`` renumbered 0..n so ``.index`` matches position.
+
+    A prompt built from a sublist (e.g. ``_top_twins``) must have its buttons carry
+    positions in *that* list, since the callback resolves a pick against the list in
+    view. Copies (not in-place) so the originals' indices are left untouched.
+    """
+    from dataclasses import replace
+
+    return [replace(c, index=i) for i, c in enumerate(candidates)]
+
+
+def _off_search_fallback(tag_result: TagResult) -> "Candidate | str":
+    """OFF-mode choice when a fingerprint match is below the confidence bar.
+
+    Falls back to beets' text search exactly as if the file had not fingerprinted:
+    import the top text candidate when beets recommends it strongly, else import
+    as-is. Returns a ``Candidate`` or the ``"asis"`` sentinel.
+    """
+    sc = tag_result.search_candidates
+    rec = tag_result.search_recommendation
+    is_high = rec is not None and rec >= Recommendation.strong
+    return sc[0] if (is_high and sc) else "asis"
+
+
+async def _confirm_looping(
+    bot: Bot, tg_id: int, file_id: str, filename: str,
+    tag_result: TagResult, file_path: Path,
+    states: dict[str, "FileState"], report: Callable[[], Awaitable[None]],
+) -> "Candidate | str | None":
+    """Prompt, re-prompting as a full list when the user taps "See others".
+
+    The strong single-match prompt's "See others" resolves to the ``"list"``
+    sentinel; we drop the recommendation to force the list layout and re-ask.
+    Returns a chosen ``Candidate``, ``"asis"``, or ``None`` (skip).
+    """
+    while True:
+        result = await _queue_confirmation(
+            bot, tg_id, file_id, filename, tag_result, file_path, states, report
+        )
+        if result != "list":
+            return result
+        tag_result.recommendation = Recommendation.none
 
 
 @dataclass
@@ -478,21 +530,34 @@ class _ConfirmationRequest:
     # frees callback_data to hold only the choice (filenames alone can already
     # blow Telegram's 64-byte callback_data cap, see BUTTON_DATA_INVALID).
     message_id: int | None = None
+    # Flipped by the "Show all results" button on a fingerprint prompt: the active
+    # candidate list (rendered and resolved against) switches from the fingerprint
+    # set (tag_result.candidates) to the full text-search net
+    # (tag_result.search_candidates). One-way for the life of the prompt.
+    showing_all: bool = False
+
+
+def _active_candidates(req: "_ConfirmationRequest") -> list:
+    """The candidate list currently in view: the full text net once "Show all
+    results" has been clicked, otherwise the primary (fingerprint or text) set."""
+    tr = req.tag_result
+    return tr.search_candidates if req.showing_all else tr.candidates
 
 
 def _render_list_page(req: "_ConfirmationRequest") -> tuple[str, InlineKeyboardMarkup]:
-    """Render one page of the candidate list, with paging controls when needed.
+    """Render one page of the active candidate list, with paging controls.
 
     Page 1 holds ``_FIRST_PAGE_SIZE`` candidates, every later page holds
     ``_PAGE_SIZE`` (see ``_page_bounds``/``_total_pages``); row layout within a
-    page comes from ``_row_sizes``. Each candidate keeps its global number
-    (``.index + 1``), and its button carries the original ``.index`` so the
-    selection resolves against the full list regardless of the current page.
-    When there is more than one page a nav row (``<<`` / ``page/total`` /
-    ``>>``) is added; ``req.page`` is clamped here so the caller can bump it
-    freely. Mutates ``req.page`` to the clamped value.
+    page comes from ``_row_sizes``. Each candidate's button carries its ``.index``
+    (its position in the active list, which the callback resolves against) and
+    shows its combined confidence percent. When there is more than one page a nav
+    row (``<<`` / ``page/total`` / ``>>``) is added; ``req.page`` is clamped here
+    so the caller can bump it freely. Mutates ``req.page`` to the clamped value. A
+    fingerprint prompt also gets a "Show all results" row that reveals the full
+    text-search net (``tag_result.search_candidates``).
     """
-    cands = req.tag_result.candidates
+    cands = _active_candidates(req)
     pages = _total_pages(len(cands))
     req.page = max(0, min(req.page, pages - 1))
     start, end = _page_bounds(len(cands), req.page)
@@ -512,7 +577,7 @@ def _render_list_page(req: "_ConfirmationRequest") -> tuple[str, InlineKeyboardM
             title = html.escape(c.title)
             text += f"{n}. {artist} — {title}{_candidate_detail(c)}\n"
             row.append(InlineKeyboardButton(
-                text=f"#{n} ({(1 - c.distance) * 100:.0f}%)",
+                text=f"#{n} ({c.confidence * 100:.0f}%)",
                 callback_data=f"conf{_CB_SEP}{c.index}",
             ))
         rows.append(row)
@@ -522,6 +587,11 @@ def _render_list_page(req: "_ConfirmationRequest") -> tuple[str, InlineKeyboardM
             InlineKeyboardButton(text="<<", callback_data=f"conf{_CB_SEP}prev"),
             InlineKeyboardButton(text=f"{req.page + 1}/{pages}", callback_data=f"conf{_CB_SEP}noop"),
             InlineKeyboardButton(text=">>", callback_data=f"conf{_CB_SEP}next"),
+        ])
+    # On a fingerprint prompt, offer the discarded text-search net as a fallback.
+    if not req.showing_all and req.tag_result.fingerprinted and req.tag_result.search_candidates:
+        rows.append([
+            InlineKeyboardButton(text="Show all results", callback_data=f"conf{_CB_SEP}showall"),
         ])
     rows.append([
         InlineKeyboardButton(text="Import as-is", callback_data=f"conf{_CB_SEP}asis"),
@@ -539,14 +609,14 @@ async def _ask_confirmation(bot: Bot, tg_id: int, req: "_ConfirmationRequest") -
             InlineKeyboardButton(text="Skip", callback_data=f"conf{_CB_SEP}skip"),
         ]]
         text = f"❌ No matches found for:\n<i>{fname}</i>"
-    elif tag.recommendation >= Recommendation.strong:
+    elif tag.recommendation >= Recommendation.strong and not tag.fingerprinted:
         c = tag.candidates[0]
         artist = html.escape(c.artist)
         title = html.escape(c.title)
         text = (
             f"❓ Import <i>{fname}</i>?\n\n"
             f"Match: <i>{artist} — {title}</i>{_candidate_detail(c)}\n"
-            f"Confidence: <b>{(1 - c.distance) * 100:.0f}%</b>"
+            f"Confidence: <b>{c.confidence * 100:.0f}%</b>"
         )
         buttons = [[
             InlineKeyboardButton(text="Import", callback_data=f"conf{_CB_SEP}0"),
@@ -608,52 +678,59 @@ async def _process_file(
         mode = ConfirmationMode(user_settings.get("confirmation", "auto"))
         enrich = user_settings.get("enrich", True)
 
-        is_high = tag_result.recommendation >= Recommendation.strong
-        chosen_index: int | str | None = None
+        cands = tag_result.candidates
+        # chosen is a Candidate (import it), "asis", or None (skip).
+        chosen: "Candidate | str | None" = None
 
-        if mode == ConfirmationMode.OFF:
-            chosen_index = 0 if (is_high and tag_result.candidates) else "asis"
-        elif mode == ConfirmationMode.AUTO and is_high and tag_result.candidates:
-            # On the fingerprint path the whole candidate set already *is* the
-            # ambiguity (every entry is an audio match), so any leftover after
-            # dedup means "prompt". On the text path we instead reconstruct which
-            # recordings hide behind the top pick via same-artist+title twins.
-            group = (
-                tag_result.candidates
-                if tag_result.fingerprinted
-                else _top_twins(tag_result.candidates)
-            )
-            if len(group) == 1:
-                chosen_index = 0  # unique high-confidence match: import without asking
+        if tag_result.fingerprinted:
+            top = cands[0].confidence if cands else 0.0
+            passes = top >= _FP_CONFIDENCE_THRESHOLD
+            if mode == ConfirmationMode.OFF:
+                # Trust a confident fingerprint outright; below the bar fall back to
+                # beets' text search rather than picking a weak audio match.
+                chosen = cands[0] if passes else _off_search_fallback(tag_result)
+            elif mode == ConfirmationMode.AUTO and passes and len(cands) == 1:
+                chosen = cands[0]  # lone, confident fingerprint: import silently
             else:
-                # Ambiguous: prompt, but only among this group, not the whole list.
-                # The buttons carry each candidate's original .index (its position
-                # in the full list), so the int result still resolves against
-                # tag_result.candidates below.
-                chosen_index = await _queue_confirmation(
-                    bot, tg_id, file_id, filename,
-                    TagResult(candidates=group, recommendation=Recommendation.none),
-                    file_path, states, report,
+                # AUTO below the bar or with twins, and ON: prompt with the
+                # fingerprint set (a "Show all results" button reveals the text net).
+                chosen = await _confirm_looping(
+                    bot, tg_id, file_id, filename, tag_result, file_path, states, report
                 )
         else:
-            while True:
-                chosen_index = await _queue_confirmation(bot, tg_id, file_id, filename, tag_result, file_path, states, report)
-                if chosen_index != "list":
-                    break
-                tag_result.recommendation = Recommendation.none
+            # Text-search path, unchanged in spirit: OFF imports #0 when beets
+            # recommends strongly (else as-is); AUTO auto-imports a unique top pick
+            # but prompts among same-title twins; ON always prompts.
+            is_high = tag_result.recommendation >= Recommendation.strong
+            if mode == ConfirmationMode.OFF:
+                chosen = cands[0] if (is_high and cands) else "asis"
+            elif mode == ConfirmationMode.AUTO and is_high and cands:
+                group = _top_twins(cands)
+                if len(group) == 1:
+                    chosen = group[0]
+                else:
+                    chosen = await _confirm_looping(
+                        bot, tg_id, file_id, filename,
+                        TagResult(candidates=_reindexed(group), recommendation=Recommendation.none),
+                        file_path, states, report,
+                    )
+            else:
+                chosen = await _confirm_looping(
+                    bot, tg_id, file_id, filename, tag_result, file_path, states, report
+                )
 
-        if chosen_index is None:
+        if chosen is None:
             states[file_id] = FileState(filename, FileStatus.SKIPPED)
             log.info("skipped %r (tg_id=%s): no selection", filename, tg_id)
             await report()
             return
 
-        is_asis = chosen_index == "asis"
+        is_asis = chosen == "asis"
         if is_asis:
             staged, dest = await stage_as_is(file_path, db_user.username)
             mb_id = None
         else:
-            candidate = tag_result.candidates[int(chosen_index)]
+            candidate = chosen
             staged, dest = await apply_and_stage(file_path, candidate, enrich)
             mb_id = candidate.mb_track_id
 
@@ -682,15 +759,12 @@ async def _process_file(
             if existing:
                 old_pool = pool_root / existing.pool_path
                 is_upgrade = is_better(new_bitrate, new_format, existing.bitrate, existing.format)
-                # A same-or-better upload replaces the recorded copy (refreshing
-                # tags on a re-upload of equal quality); a strictly worse one
-                # loses -- unless the recorded copy is missing (a dangling row),
-                # in which case even a worse upload heals it instead of being
-                # discarded.
-                replaces = is_better(
-                    new_bitrate, new_format, existing.bitrate, existing.format, or_equal=True
-                )
-                if replaces or not old_pool.exists():
+                # Overwrite the pooled copy only on a strict quality upgrade, or to
+                # heal a dangling row whose pool file went missing. An equal-quality
+                # upload keeps the existing copy and drops the staged duplicate -- a
+                # same-quality re-upload no longer overwrites (so it no longer
+                # refreshes tags); a strictly worse one likewise loses.
+                if is_upgrade or not old_pool.exists():
                     pool_file = promote_pool_file(staged, dest)
                     if pool_file != old_pool:
                         own_result = await session.exec(
@@ -775,7 +849,7 @@ async def _queue_confirmation(
     file_path: Path,
     states: dict[str, FileState],
     report: Callable[[], Awaitable[None]],
-) -> int | str | None:
+) -> "Candidate | str | None":
     future: asyncio.Future = get_running_loop().create_future()
 
     req = _ConfirmationRequest(filename=filename, tag_result=tag_result, file_path=file_path, future=future)
@@ -837,10 +911,16 @@ async def cb_confirmation(callback: CallbackQuery, bot: Bot) -> None:
         await safe_answer(callback, "No pending confirmation")
         return
 
-    if choice in ("prev", "next", "noop"):
-        # Paging: re-render the list in place; the pending choice is untouched.
+    if choice in ("prev", "next", "noop", "showall"):
+        # In-place re-render; the pending choice is untouched. Paging bumps the
+        # page; "Show all results" swaps the active list to the full text net and
+        # resets to page 1.
         if choice != "noop":
-            req.page += 1 if choice == "next" else -1
+            if choice == "showall":
+                req.showing_all = True
+                req.page = 0
+            else:
+                req.page += 1 if choice == "next" else -1
             text, markup = _render_list_page(req)  # clamps req.page
             try:
                 await callback.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
@@ -856,11 +936,19 @@ async def cb_confirmation(callback: CallbackQuery, bot: Bot) -> None:
     elif choice == "list":
         req.future.set_result("list")
     else:
+        # A candidate pick: the button carries the candidate's position in the
+        # currently-active list (fingerprint set, or full text net after "Show
+        # all"), so resolve it here and hand back the Candidate itself.
+        active = _active_candidates(req)
         try:
-            req.future.set_result(int(choice))
+            idx = int(choice)
         except ValueError:
             await safe_answer(callback, "Invalid choice")
             return
+        if not 0 <= idx < len(active):
+            await safe_answer(callback, "Invalid choice")
+            return
+        req.future.set_result(active[idx])
 
     await callback.message.delete()
     await safe_answer(callback)

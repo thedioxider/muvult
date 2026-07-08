@@ -16,10 +16,11 @@ from src.db import init_db, get_session, Track, TrackOwnership, User
 from src.pool import create_symlink, find_cover
 
 
-def _c(index, artist, title, disambig=None):
+def _c(index, artist, title, disambig=None, confidence=0.0):
     return Candidate(
         index=index, artist=artist, title=title, album="", year=None,
         mb_track_id=f"id{index}", distance=0.0, _match=None, disambig=disambig,
+        confidence=confidence,
     )
 
 
@@ -129,6 +130,55 @@ def test_render_list_page_button_carries_global_index():
     assert f"conf{sep}7" in datas
 
 
+def test_render_list_page_button_shows_confidence_percent():
+    cands = [_c(0, "A", "T0", confidence=0.63), _c(1, "A", "T1", confidence=0.9)]
+    _, markup = upload._render_list_page(_req(cands))
+    labels = _btn_texts(markup)
+    assert any("63%" in t for t in labels)
+    assert any("90%" in t for t in labels)
+
+
+def _fp_req(candidates, search_candidates, page=0, showing_all=False):
+    from src.models import TagResult
+    return upload._ConfirmationRequest(
+        filename="song.mp3",
+        tag_result=TagResult(
+            candidates=candidates, recommendation=0, fingerprinted=True,
+            search_candidates=search_candidates,
+        ),
+        file_path=None,
+        future=MagicMock(),
+        page=page,
+        showing_all=showing_all,
+    )
+
+
+def test_fingerprint_prompt_offers_show_all_results():
+    sep = upload._CB_SEP
+    fp = [_c(0, "SOAD", "Aerials", confidence=0.7)]
+    search = [_c(0, "SOAD", "Aerials"), _c(1, "Other", "Aerials")]
+    _, markup = upload._render_list_page(_fp_req(fp, search))
+    assert f"conf{sep}showall" in _btn_datas(markup)
+
+
+def test_show_all_swaps_to_search_candidates_and_hides_button():
+    sep = upload._CB_SEP
+    fp = [_c(0, "SOAD", "Aerials", confidence=0.7)]
+    search = [_c(0, "SOAD", "Aerials"), _c(1, "Other", "Aerials")]
+    req = _fp_req(fp, search, showing_all=True)
+    text, markup = upload._render_list_page(req)
+    # The full text net is now in view; the reveal button is gone.
+    assert "Other — Aerials" in text
+    assert f"conf{sep}showall" not in _btn_datas(markup)
+
+
+def test_non_fingerprint_prompt_has_no_show_all_button():
+    sep = upload._CB_SEP
+    cands = [_c(i, "A", f"T{i}") for i in range(3)]
+    _, markup = upload._render_list_page(_req(cands))
+    assert f"conf{sep}showall" not in _btn_datas(markup)
+
+
 def test_row_sizes_first_page():
     assert upload._row_sizes(0, True) == []
     assert upload._row_sizes(1, True) == [1]
@@ -195,7 +245,21 @@ def test_format_status_omits_empty_groups():
 
 
 @pytest.mark.asyncio
-async def test_find_existing_prefers_recording_id(tmp_path):
+async def test_find_existing_matches_by_pool_path(tmp_path):
+    # The path is occupied by a row under a *different* recording id (arrow
+    # re-tagged from 05ed7f3c to 86349be4). Path is primary, so we adopt that row
+    # instead of inserting a duplicate that violates the unique path.
+    await init_db(str(tmp_path / "db"))
+    async with get_session() as s:
+        s.add(Track(pool_path="a/b/7 - arrow.mp3", musicbrainz_id="05ed7f3c", format="mp3", bitrate=320))
+        await s.commit()
+        found = await _find_existing_track(s, "86349be4", "a/b/7 - arrow.mp3")
+        assert found is not None and found.musicbrainz_id == "05ed7f3c"
+
+
+@pytest.mark.asyncio
+async def test_find_existing_falls_back_to_recording_id(tmp_path):
+    # No row holds the path -> fall back to the recording id.
     await init_db(str(tmp_path / "db"))
     async with get_session() as s:
         s.add(Track(pool_path="a/b/1 - x.mp3", musicbrainz_id="rec-A", format="mp3", bitrate=320))
@@ -205,16 +269,15 @@ async def test_find_existing_prefers_recording_id(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_find_existing_falls_back_to_pool_path_on_new_recording(tmp_path):
-    # The collision case: the path is occupied by a row under a *different*
-    # recording id (arrow re-tagged from 05ed7f3c to 86349be4). We must adopt that
-    # row via pool_path, not insert a duplicate that violates the unique path.
+async def test_find_existing_prefers_pool_path_over_recording_id(tmp_path):
+    # Path and mbid point at different rows: path wins.
     await init_db(str(tmp_path / "db"))
     async with get_session() as s:
-        s.add(Track(pool_path="a/b/7 - arrow.mp3", musicbrainz_id="05ed7f3c", format="mp3", bitrate=320))
+        s.add(Track(pool_path="p1", musicbrainz_id="rec-A", format="mp3", bitrate=320))
+        s.add(Track(pool_path="p2", musicbrainz_id="rec-B", format="mp3", bitrate=320))
         await s.commit()
-        found = await _find_existing_track(s, "86349be4", "a/b/7 - arrow.mp3")
-        assert found is not None and found.musicbrainz_id == "05ed7f3c"
+        found = await _find_existing_track(s, "rec-A", "p2")
+        assert found is not None and found.musicbrainz_id == "rec-B"
 
 
 @pytest.mark.asyncio
