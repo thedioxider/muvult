@@ -13,6 +13,7 @@ from sqlmodel import select
 from .beets_svc import fetch_cover_art_full
 from .db import Track, TrackOwnership, User, get_session
 from .pool import (
+    absorb_user_lyrics,
     create_symlink,
     ensure_cover_symlink,
     find_cover,
@@ -65,12 +66,15 @@ async def promote_and_relink(session, pool_root: Path, track: Track, staged: Pat
 async def recreate_links(username: str | None = None) -> tuple[int, list[str]] | None:
     """Reconcile every owner's library against the pool, idempotently.
 
-    Rebuilds a track symlink only when it is missing, stale, or mispointed;
-    otherwise leaves it and just reconciles that track's lyrics sidecars (links
-    ones that appeared out-of-band, removes ones the pool no longer has). Reaches
-    the same end state as a full wipe-and-recreate without the SSD churn -- so it
-    is safe to run daily. Returns ``(rebuilt_count, missing_pool_paths)``, or
-    ``None`` when a named user does not exist."""
+    Rebuilds a track symlink only when it is missing, stale, or mispointed
+    (keeping the track's lyrics in place -- a repair is not a removal); otherwise
+    leaves it. Then, per affected track, reconciles lyrics across **all** its
+    owners: a real lyrics file that appeared in some library is absorbed into the
+    pool (`absorb_user_lyrics`) and shared to everyone, pool sidecars are linked
+    where missing, and stale links into the pool are pruned. Reaches the same end
+    state as a full wipe-and-recreate without the SSD churn -- so it is safe to
+    run daily. Returns ``(rebuilt_count, missing_pool_paths)``, or ``None`` when a
+    named user does not exist."""
     from .config import settings
 
     music_root = Path(settings.music_root)
@@ -86,6 +90,7 @@ async def recreate_links(username: str | None = None) -> tuple[int, list[str]] |
         else:
             users = (await session.exec(select(User))).all()
 
+        affected_track_ids: set[int] = set()
         for user in users:
             user_dir = music_root / user.username
             rows = (
@@ -103,12 +108,34 @@ async def recreate_links(username: str | None = None) -> tuple[int, list[str]] |
                 desired = link_path_for(pool_file, user_dir, flat=track.is_asis)
                 current = Path(ownership.symlink_path)
                 if current != desired or not links_to(current, pool_file):
-                    remove_symlink(current, user_library_root(current, music_root))
+                    # A repair, not a removal -- keep the track's lyrics.
+                    remove_symlink(current, user_library_root(current, music_root), remove_lyrics=False)
                     new_link = create_symlink(pool_file, user_dir, flat=track.is_asis)
                     ownership.symlink_path = str(new_link)
                     count += 1
-                else:
-                    reconcile_sidecars(pool_file, desired.parent)
+                affected_track_ids.add(track.id)
+
+        # Lyrics run across *all* owners of each affected track (not just the
+        # filtered users), so a lyrics found in one library is shared to everyone.
+        for track_id in affected_track_ids:
+            track = (await session.exec(select(Track).where(Track.id == track_id))).first()
+            pool_file = pool_root / track.pool_path
+            if not pool_file.exists():
+                continue
+            owns = (
+                await session.exec(
+                    select(User)
+                    .join(TrackOwnership, TrackOwnership.user_id == User.id)
+                    .where(TrackOwnership.track_id == track_id)
+                )
+            ).all()
+            owner_dirs = [
+                link_path_for(pool_file, music_root / u.username, flat=track.is_asis).parent
+                for u in owns
+            ]
+            absorb_user_lyrics(pool_file, owner_dirs)
+            for d in owner_dirs:
+                reconcile_sidecars(pool_file, d)
         await session.commit()
 
     return count, missing

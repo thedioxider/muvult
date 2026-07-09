@@ -116,6 +116,48 @@ async def test_recreatelinks_relinks_asis_flat(tmp_path):
         assert Path(own.symlink_path) == flat_link
 
 
+@pytest.mark.asyncio
+async def test_recreatelinks_absorbs_user_lyrics_and_shares(tmp_path):
+    # A real lyrics file in one owner's library is moved into the pool and linked
+    # into every owner's library; a user's own non-pool lyrics are left alone.
+    from src.library import recreate_links
+    from src.pool import create_symlink
+
+    await init_db(str(tmp_path / "db"))
+    music_root = tmp_path / "music"
+    pool_file = music_root / ".pool" / "Ar" / "Al" / "song.flac"
+    pool_file.parent.mkdir(parents=True)
+    pool_file.write_bytes(b"audio")
+
+    async with get_session() as s:
+        s.add(User(id=1, tg_id=1, username="alice", navidrome_user_id="a", navidrome_library_id=1))
+        s.add(User(id=2, tg_id=2, username="bob", navidrome_user_id="b", navidrome_library_id=2))
+        s.add(Track(id=1, pool_path="Ar/Al/song.flac", musicbrainz_id="m", format="flac", bitrate=1000))
+        await s.commit()
+        for uid, name in ((1, "alice"), (2, "bob")):
+            link = create_symlink(pool_file, music_root / name)
+            s.add(TrackOwnership(track_id=1, user_id=uid, symlink_path=str(link)))
+        await s.commit()
+
+    # alice's plugin dropped two real lyrics files (both lyrics extensions) that
+    # never made it to the pool.
+    alice_album = music_root / "alice" / "Ar" / "Al"
+    bob_album = music_root / "bob" / "Ar" / "Al"
+    (alice_album / "song.lrc").write_text("synced lyrics")
+    (alice_album / "song.txt").write_text("plain lyrics")
+
+    with patch("src.config.settings", MagicMock(music_root=str(music_root))):
+        count, missing = await recreate_links()
+
+    for name, body in (("song.lrc", "synced lyrics"), ("song.txt", "plain lyrics")):
+        pooled = pool_file.parent / name
+        assert pooled.exists() and pooled.read_text() == body  # absorbed into the pool
+        # every owner points at the one pooled copy by symlink (no second copy)
+        for album in (alice_album, bob_album):
+            link = album / name
+            assert link.is_symlink() and link.resolve() == pooled.resolve()
+
+
 async def _seed_retag_tracks():
     async with get_session() as s:
         s.add(Track(id=1, pool_path="Ar/Al1/a.mp3", musicbrainz_id="m1", format="flac", bitrate=1000))

@@ -104,14 +104,22 @@ Enrichment is **on by default** and can be turned off per user via `/settings`.
 
 ### Lyrics sidecars
 
-Lyrics files that live in the pool next to a track (any file sharing the track's
-exact name with a `.ttml`, `.yaml`, `.yml`, `.elrc`, `.lrc`, `.srt`, or `.txt`
-extension) are treated as part of that track. They are symlinked into every
-owner's library alongside the track and removed when the track is removed or
-replaced. muvult doesn't create these files itself — they arrive in the pool
-out-of-band — so each user's library simply **mirrors** the pool: a nightly
-reconcile (and `/recreatelinks`) links lyrics that appeared since the last run and
-removes any in a user's library that the pool no longer has.
+Lyrics files that live next to a track (any file sharing the track's exact name
+with a `.yaml`, `.yml`, `.elrc`, `.lrc`, `.srt`, or `.txt` extension) are treated
+as part of that track. They are symlinked into every owner's library alongside the
+track, and are removed only when the track itself is removed or replaced (a quality
+upgrade / re-tag / move drops them, since they may no longer match).
+
+The pool is the shared store, but lyrics can enter it from either side. A nightly
+reconcile (also `/recreatelinks`):
+
+- links pool lyrics into any owner's library that lacks them;
+- **absorbs** a new lyrics file that a plugin wrote into one user's library — it is
+  moved into the pool and then linked into *every* owner's library;
+- prunes stale links whose pool lyrics were deleted.
+
+It never deletes a user's own lyrics file that isn't in the pool — only a stale
+link (or the track's removal) takes lyrics away.
 
 ### Confirmation modes
 

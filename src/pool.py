@@ -15,7 +15,7 @@ _COVER_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 # reconciled on ``recreatelinks``, and removed with it (a replacement/move drops
 # them all). ``.txt``/``.yaml`` are broad, but the exact-stem match keeps them
 # tied to one track.
-_LYRICS_EXTS = {".ttml", ".yaml", ".yml", ".elrc", ".lrc", ".srt", ".txt"}
+_LYRICS_EXTS = {".elrc", ".lrc", ".txt"}
 
 
 def _is_cover(path: Path) -> bool:
@@ -58,22 +58,60 @@ def remove_link_sidecars(track_link: Path) -> None:
         e.unlink(missing_ok=True)
 
 
-def reconcile_sidecars(pool_file: Path, link_parent: Path) -> None:
-    """Make ``link_parent``'s lyrics for this track mirror the pool's sidecars.
+def _points_into_pool(link: Path, pool_root: Path) -> bool:
+    """Whether a symlink's target path lands inside the pool (target need not exist)."""
+    try:
+        target = Path(os.path.normpath(link.parent / os.readlink(link)))
+        target.relative_to(pool_root)
+        return True
+    except (OSError, ValueError):
+        return False
 
-    Touches the filesystem only where they diverge -- links a pool sidecar that
-    is missing, removes a library lyrics entry (symlink or real plugin file) with
-    no pool counterpart -- so a steady-state reconcile writes nothing. A same-name
-    entry already present is left as-is (a plugin's own file is not clobbered)."""
+
+def absorb_user_lyrics(pool_file: Path, link_parents: list[Path]) -> None:
+    """Move a real, not-yet-pooled lyrics file from any owner's library into the
+    pool so it can be shared. Named by the track stem it already carries; the file
+    is left in the pool for a following ``reconcile_sidecars`` to link back. First
+    occurrence of a given filename wins; symlinks (already ours) are skipped."""
+    pool_dir = pool_file.parent
+    for parent in link_parents:
+        for e in _library_lyrics(parent, pool_file.stem):
+            if e.is_symlink():
+                continue
+            dest = pool_dir / e.name
+            if not dest.exists():
+                shutil.move(str(e), str(dest))
+
+
+def reconcile_sidecars(pool_file: Path, link_parent: Path) -> None:
+    """Reconcile ``link_parent``'s lyrics for this track against the pool.
+
+    Links a pool sidecar the library lacks, and converts a same-named real file
+    (one a lyrics plugin wrote) or a symlink pointing elsewhere into a symlink to
+    the pool file -- so a lyrics present in both places is always the pool's. Also
+    drops a **stale** lyrics symlink into the pool whose target is gone. It never
+    removes a library lyrics *real file* with no pool counterpart -- that is the
+    user's own and only goes when the track itself does (`remove_link_sidecars`).
+    Idempotent -- an already-correct link is left untouched."""
+    pool_root = _pool_root(pool_file)
     desired = {sc.name: sc for sc in find_sidecars(pool_file)}
-    existing = {e.name: e for e in _library_lyrics(link_parent, pool_file.stem)}
-    for name, entry in existing.items():
-        if name not in desired:
-            entry.unlink(missing_ok=True)
     for name, sc in desired.items():
-        if name not in existing:
-            target = link_parent / name
-            target.symlink_to(os.path.relpath(sc, link_parent))
+        target = link_parent / name
+        if target.is_symlink():
+            try:
+                if target.resolve() == sc.resolve():
+                    continue
+            except OSError:
+                pass  # dangling/broken -> repoint below
+            target.unlink()
+        elif target.exists():
+            target.unlink()  # real same-name file -> replace with a link to the pool
+        target.symlink_to(os.path.relpath(sc, link_parent))
+    for e in _library_lyrics(link_parent, pool_file.stem):
+        # stale link into the pool (its sidecar was removed) -> prune; a real file
+        # or a link pointing outside the pool is the user's own and stays.
+        if e.name not in desired and e.is_symlink() and _points_into_pool(e, pool_root):
+            e.unlink(missing_ok=True)
 
 
 def links_to(link: Path, pool_file: Path) -> bool:
@@ -164,12 +202,16 @@ def user_library_root(symlink_path: Path, music_root: Path) -> Path:
     return music_root / symlink_path.relative_to(music_root).parts[0]
 
 
-def remove_symlink(symlink_path: Path, library_root: Path | None = None) -> None:
+def remove_symlink(
+    symlink_path: Path, library_root: Path | None = None, *, remove_lyrics: bool = True
+) -> None:
     if symlink_path.is_symlink():
         symlink_path.unlink()
         # The track's lyrics go with it (both our links and any real plugin
         # file), so a user's lyrics never outlive the track they belong to.
-        remove_link_sidecars(symlink_path)
+        # ``remove_lyrics=False`` keeps them for a relocation/repair (recreatelinks).
+        if remove_lyrics:
+            remove_link_sidecars(symlink_path)
         # Prune now-empty album/artist dirs, but keep the user's library dir
         # itself (removing it on the last track would orphan the Navidrome
         # library). ``library_root`` is that boundary; None keeps old behavior.

@@ -1,6 +1,7 @@
 from pathlib import Path
 import pytest
 from src.pool import (
+    absorb_user_lyrics,
     create_symlink,
     ensure_cover_symlink,
     find_cover,
@@ -252,21 +253,62 @@ def test_remove_pool_file_takes_pool_sidecars(dirs):
     assert not pool_dir.exists()  # last track + its lyrics gone -> dir pruned
 
 
-def test_reconcile_sidecars_links_missing_and_removes_extra(dirs):
+def test_reconcile_sidecars_links_pool_and_keeps_user_files(dirs):
     pool_dir, user_dir, root = dirs
     track = pool_dir / "01 - Song.mp3"
     track.write_bytes(b"audio")
     (pool_dir / "01 - Song.lrc").write_text("pooled")
     album = user_dir / "Artist" / "Album"
     album.mkdir(parents=True)
-    # a stale library lyrics entry with no pool counterpart
-    stale = album / "01 - Song.txt"
-    stale.write_text("stale plugin lyrics")
+    # a user/plugin lyrics file with NO pool counterpart -> must be kept
+    own = album / "01 - Song.txt"
+    own.write_text("user's own lyrics")
+    # a real file whose name matches a pool sidecar -> linked to the pool
+    dup = album / "01 - Song.lrc"
+    dup.write_text("stale copy")
 
     reconcile_sidecars(track, album)
 
-    assert not stale.exists()                       # no pool counterpart -> removed
-    assert (album / "01 - Song.lrc").is_symlink()   # pool sidecar -> linked
+    assert own.exists() and not own.is_symlink()   # no pool counterpart -> kept as-is
+    assert dup.is_symlink()                         # same name in pool -> linked
+    assert dup.resolve() == (pool_dir / "01 - Song.lrc").resolve()
+
+
+def test_reconcile_sidecars_prunes_stale_pool_link(dirs):
+    pool_dir, user_dir, root = dirs
+    track = pool_dir / "01 - Song.mp3"
+    track.write_bytes(b"audio")
+    lrc = pool_dir / "01 - Song.lrc"
+    lrc.write_text("pooled")
+    link = create_symlink(track, user_dir)  # links the .lrc too
+    album = link.parent
+    stale_link = album / "01 - Song.lrc"
+    assert stale_link.is_symlink()
+    # pool sidecar vanishes -> the library link is now a stale link into the pool
+    lrc.unlink()
+
+    reconcile_sidecars(track, album)
+
+    assert not stale_link.exists() and not stale_link.is_symlink()  # stale pool link pruned
+
+
+def test_absorb_user_lyrics_moves_new_file_into_pool(dirs):
+    pool_dir, user_dir, root = dirs
+    track = pool_dir / "01 - Song.mp3"
+    track.write_bytes(b"audio")
+    album = user_dir / "Artist" / "Album"
+    album.mkdir(parents=True)
+    new_lyrics = album / "01 - Song.lrc"
+    new_lyrics.write_text("fetched by a plugin")
+
+    absorb_user_lyrics(track, [album])
+
+    pooled = pool_dir / "01 - Song.lrc"
+    assert pooled.exists() and pooled.read_text() == "fetched by a plugin"
+    assert not new_lyrics.exists()  # moved (not copied) out of the library
+    # a following reconcile links it back
+    reconcile_sidecars(track, album)
+    assert new_lyrics.is_symlink() and new_lyrics.resolve() == pooled.resolve()
 
 
 def test_reconcile_sidecars_is_noop_when_in_sync(dirs):

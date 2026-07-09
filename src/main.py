@@ -20,11 +20,14 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 _RECONCILE_INTERVAL = 24 * 60 * 60
+# Hold a strong reference: asyncio only weakly references tasks, so a bare
+# create_task() could be garbage-collected mid-sleep and silently stop the loop.
+_daily_task: asyncio.Task | None = None
 
 
 async def _daily_link_reconcile() -> None:
-    """Re-run ``recreatelinks`` for all users once a day so sidecar lyrics that
-    arrived in the pool out-of-band get linked (and vanished ones unlinked)."""
+    """Re-run ``recreatelinks`` for all users once a day so lyrics that landed in
+    the pool (or a user's library) out-of-band get shared to every owner."""
     while True:
         await asyncio.sleep(_RECONCILE_INTERVAL)
         try:
@@ -52,7 +55,8 @@ async def main() -> None:
     dp.include_router(user_router)
     dp.include_router(upload_router)
 
-    asyncio.create_task(_daily_link_reconcile())
+    global _daily_task
+    _daily_task = asyncio.create_task(_daily_link_reconcile())
     await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
 
 
