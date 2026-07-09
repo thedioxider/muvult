@@ -92,7 +92,7 @@ _PROMPT_MIN_HOLD_SECONDS = 0.5  # floor pause after an answer before the next pr
 # human look. In AUTO a lone match at/above it auto-imports (below it prompts); in
 # OFF a match at/above it is picked outright, and below it we fall back to beets'
 # text search (the fingerprint is deemed too weak to be authoritative).
-_FP_CONFIDENCE_THRESHOLD = 0.80
+_FP_CONFIDENCE_THRESHOLD = 0.85
 
 
 def _get_batch_lock(tg_id: int) -> asyncio.Lock:
