@@ -102,6 +102,17 @@ album, track number, disc, or year. When enabled, muvult fills these in:
 This reuses the by-id lookup already made at import (no extra MusicBrainz request).
 Enrichment is **on by default** and can be turned off per user via `/settings`.
 
+### Lyrics sidecars
+
+Lyrics files that live in the pool next to a track (any file sharing the track's
+exact name with a `.ttml`, `.yaml`, `.yml`, `.elrc`, `.lrc`, `.srt`, or `.txt`
+extension) are treated as part of that track. They are symlinked into every
+owner's library alongside the track and removed when the track is removed or
+replaced. muvult doesn't create these files itself — they arrive in the pool
+out-of-band — so each user's library simply **mirrors** the pool: a nightly
+reconcile (and `/recreatelinks`) links lyrics that appeared since the last run and
+removes any in a user's library that the pool no longer has.
+
 ### Confirmation modes
 
 Each user picks how much the bot asks before importing (via `/settings`); the
@@ -133,7 +144,9 @@ strength comes from beets' own match recommendation:
 - `/settgid <username> <new_tg_id>` -- rebind a user to a different Telegram account
 - `/setusername <old> <new>` -- rename a user (moves dir, updates symlinks)
 - `/users` -- list registered users
-- `/recreatelinks [username]` -- rebuild symlinks from the DB (repair tool)
+- `/recreatelinks [username]` -- reconcile each owner's library against the pool
+  (fixes stale/missing track symlinks, syncs lyrics sidecars). Idempotent -- only
+  touches what diverged; also runs automatically once a day.
 - `/removetrack <path|prefix/*> [username]` -- remove tracks by pool path
 - `/retag [path|prefix/*]` -- re-fetch tags/album/cover for matched tracks by their
   stored MusicBrainz id; no argument re-tags the whole library. A `.../*` wildcard or
@@ -216,6 +229,6 @@ Tests use `pytest-asyncio` (auto mode) and `respx` to mock Navidrome's HTTP API.
 | `src/beets_svc.py`       | beets setup, candidate search, tagging + staging        |
 | `src/beets_patches.py`   | MusicBrainz search reshaping patch                     |
 | `src/navidrome.py`       | Navidrome admin API client                             |
-| `src/pool.py`            | Pool paths, symlink create/update/remove               |
-| `src/library.py`         | Shared pool/ownership glue (promote+relink, covers)    |
+| `src/pool.py`            | Pool paths, symlink + lyrics-sidecar create/update/remove |
+| `src/library.py`         | Shared pool/ownership glue (promote+relink, covers, reconcile) |
 | `src/quality.py`         | Bitrate/format comparison for upgrades                 |

@@ -13,12 +13,20 @@ from sqlmodel import select
 from .beets_svc import fetch_cover_art_full
 from .db import Track, TrackOwnership, User, get_session
 from .pool import (
+    create_symlink,
     ensure_cover_symlink,
     find_cover,
+    link_path_for,
+    links_to,
     pool_rel,
     promote_pool_file,
+    reconcile_sidecars,
+    remove_link_sidecars,
     remove_pool_file,
+    remove_sidecars,
+    remove_symlink,
     update_symlinks,
+    user_library_root,
 )
 
 log = logging.getLogger(__name__)
@@ -32,11 +40,19 @@ async def promote_and_relink(session, pool_root: Path, track: Track, staged: Pat
     identity) the old pool file is dropped, all owners' symlinks are repointed, and
     ``track.pool_path`` is updated. Returns the final pool path."""
     old_pool = pool_root / track.pool_path
+    ownerships = (
+        await session.exec(select(TrackOwnership).where(TrackOwnership.track_id == track.id))
+    ).all()
+    # A replacement (quality upgrade, re-tag, or move) invalidates any existing
+    # lyrics -- the new file carries none, and stale lyrics for a superseded
+    # recording are worse than none -- so purge them everywhere before promoting.
+    # On a path change the relink below finds no pool sidecars to re-link; on an
+    # in-place overwrite (no relink) this is the only thing that clears them.
+    remove_sidecars(old_pool)
+    for o in ownerships:
+        remove_link_sidecars(Path(o.symlink_path))
     pool_file = promote_pool_file(staged, dest)
     if pool_file != old_pool:
-        ownerships = (
-            await session.exec(select(TrackOwnership).where(TrackOwnership.track_id == track.id))
-        ).all()
         old_links = [Path(o.symlink_path) for o in ownerships]
         new_links = update_symlinks(old_pool, pool_file, old_links)
         remove_pool_file(old_pool)
@@ -44,6 +60,58 @@ async def promote_and_relink(session, pool_root: Path, track: Track, staged: Pat
             ownership.symlink_path = str(new_l)
     track.pool_path = pool_rel(pool_file)
     return pool_file
+
+
+async def recreate_links(username: str | None = None) -> tuple[int, list[str]] | None:
+    """Reconcile every owner's library against the pool, idempotently.
+
+    Rebuilds a track symlink only when it is missing, stale, or mispointed;
+    otherwise leaves it and just reconciles that track's lyrics sidecars (links
+    ones that appeared out-of-band, removes ones the pool no longer has). Reaches
+    the same end state as a full wipe-and-recreate without the SSD churn -- so it
+    is safe to run daily. Returns ``(rebuilt_count, missing_pool_paths)``, or
+    ``None`` when a named user does not exist."""
+    from .config import settings
+
+    music_root = Path(settings.music_root)
+    pool_root = music_root / ".pool"
+    count = 0
+    missing: list[str] = []
+    async with get_session() as session:
+        if username:
+            user = (await session.exec(select(User).where(User.username == username))).first()
+            if not user:
+                return None
+            users = [user]
+        else:
+            users = (await session.exec(select(User))).all()
+
+        for user in users:
+            user_dir = music_root / user.username
+            rows = (
+                await session.exec(
+                    select(TrackOwnership, Track)
+                    .join(Track, Track.id == TrackOwnership.track_id)
+                    .where(TrackOwnership.user_id == user.id)
+                )
+            ).all()
+            for ownership, track in rows:
+                pool_file = pool_root / track.pool_path
+                if not pool_file.exists():
+                    missing.append(track.pool_path)
+                    continue
+                desired = link_path_for(pool_file, user_dir, flat=track.is_asis)
+                current = Path(ownership.symlink_path)
+                if current != desired or not links_to(current, pool_file):
+                    remove_symlink(current, user_library_root(current, music_root))
+                    new_link = create_symlink(pool_file, user_dir, flat=track.is_asis)
+                    ownership.symlink_path = str(new_link)
+                    count += 1
+                else:
+                    reconcile_sidecars(pool_file, desired.parent)
+        await session.commit()
+
+    return count, missing
 
 
 async def album_owner_usernames(session, rel_album: str) -> list[str]:
