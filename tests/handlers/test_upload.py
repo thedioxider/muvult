@@ -15,11 +15,11 @@ from src.db import init_db, get_session, Track, TrackOwnership, User
 from src.pool import create_symlink, find_cover
 
 
-def _c(index, artist, title, disambig=None, confidence=0.0):
+def _c(index, artist, title, disambig=None, confidence=0.0, isrc=None):
     return Candidate(
         index=index, artist=artist, title=title, album="", year=None,
         mb_track_id=f"id{index}", distance=0.0, _match=None, disambig=disambig,
-        confidence=confidence,
+        confidence=confidence, isrc=isrc,
     )
 
 
@@ -127,6 +127,15 @@ def test_render_list_page_button_carries_global_index():
     datas = [b.callback_data for row in markup.inline_keyboard for b in row]
     assert f"conf{sep}6" in datas   # candidate #7 -> index 6
     assert f"conf{sep}7" in datas
+
+
+def test_render_list_page_marks_isrc_candidate():
+    cands = [_c(0, "A", "T0"), _c(1, "A", "T1", isrc="US1234567890")]
+    text, _ = upload._render_list_page(_req(cands))
+    # The whole line of the ISRC-registered candidate is bold, '®' after the number.
+    assert "<b>2. ® A — T1</b>" in text
+    assert "1. A — T0" in text          # plain candidate unmarked
+    assert "<b>® 1." not in text
 
 
 def test_render_list_page_button_shows_confidence_percent():

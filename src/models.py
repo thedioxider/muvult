@@ -36,6 +36,10 @@ class Candidate:
     _match: Any = field(repr=False)
     length: float | None = None
     disambig: str | None = None
+    # ISRC of the recording, when MusicBrainz has one. Present marks the
+    # canonically-registered recording (the same signal `_dedup_matches` ranks on);
+    # surfaced to the user as a bold, '®'-prefixed line in the confirmation lists.
+    isrc: str | None = None
     # Combined match confidence in [0, 1], shown to the user as a percent and used
     # for ranking/thresholds. For a fingerprint candidate it is
     # (1 - beets_text_distance) * chroma_cluster_score -- chroma anchors the

@@ -16,7 +16,16 @@ _USER_HELP = (
     "/start — welcome message\n"
     "/settings — change bot preferences\n"
     "/id — show your Telegram ID\n\n"
-    "Send audio files to upload them to your library."
+    "<b>Uploading</b>\n"
+    "Uploaded audio is matched against MusicBrainz and added to your library. "
+    "When a match is uncertain, a confirmation prompt lists the candidates:\n"
+    "  — Each candidate shows a confidence % — higher is a closer match.\n"
+    "  — <b>®</b> marks the canonically-registered recording (one with an ISRC), "
+    "usually the official studio version — a good default when unsure.\n"
+    "  — <b>Import</b> / <b>#n</b> selects a candidate; <b>See others</b> and "
+    "<b>Show all results</b> list more; <b>Import as-is</b> keeps the file's own "
+    "tags; <b>Skip</b> discards the file.\n\n"
+    "/settings controls how often prompts appear and album metadata enrichment."
 )
 
 _ADMIN_SECTION = (

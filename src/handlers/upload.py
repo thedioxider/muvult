@@ -519,7 +519,11 @@ def _render_list_page(req: "_ConfirmationRequest") -> tuple[str, InlineKeyboardM
             n = c.index + 1
             artist = html.escape(c.artist)
             title = html.escape(c.title)
-            text += f"{n}. {artist} — {title}{_candidate_detail(c)}\n"
+            # An ISRC marks the canonically-registered recording: bold the line, '®' after the number.
+            if c.isrc:
+                text += f"<b>{n}. ® {artist} — {title}{_candidate_detail(c)}</b>\n"
+            else:
+                text += f"{n}. {artist} — {title}{_candidate_detail(c)}\n"
             row.append(InlineKeyboardButton(
                 text=f"#{n} ({c.confidence * 100:.0f}%)",
                 callback_data=f"conf{_CB_SEP}{c.index}",
@@ -559,7 +563,8 @@ async def _ask_confirmation(bot: Bot, tg_id: int, req: "_ConfirmationRequest") -
         title = html.escape(c.title)
         text = (
             f"❓ Import <i>{fname}</i>?\n\n"
-            f"Match: <i>{artist} — {title}</i>{_candidate_detail(c)}\n"
+            # '®' marks the canonically-registered (ISRC) recording.
+            f"Match: {'® ' if c.isrc else ''}<i>{artist} — {title}</i>{_candidate_detail(c)}\n"
             f"Confidence: <b>{c.confidence * 100:.0f}%</b>"
         )
         buttons = [[

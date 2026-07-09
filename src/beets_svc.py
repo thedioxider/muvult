@@ -220,6 +220,7 @@ def _build_candidates(matches: list, score: float | None) -> list[Candidate]:
             _match=m,
             length=getattr(m.info, "length", None),
             disambig=getattr(m.info, "trackdisambig", None),
+            isrc=getattr(m.info, "isrc", None),
             confidence=_confidence(m.distance.distance, score),
         )
         for m in matches
