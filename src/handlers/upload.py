@@ -342,6 +342,16 @@ def _has_close_contender(candidates: list[Candidate]) -> bool:
     return any(c.confidence >= cutoff for c in candidates[1:])
 
 
+def _is_dominant_top(candidates: list[Candidate]) -> bool:
+    """True when candidate #0 is clear enough to auto-import in AUTO mode.
+
+    Dominant means unambiguous: no same-title twin (`_top_twins`) and no runner-up
+    within 90% of #0's confidence (`_has_close_contender`). Shared by the text and
+    fingerprint AUTO paths; a lone candidate is the trivial dominant case.
+    """
+    return len(_top_twins(candidates)) == 1 and not _has_close_contender(candidates)
+
+
 def _off_search_fallback(tag_result: TagResult) -> "Candidate | str":
     """OFF-mode choice when a fingerprint match is below the confidence bar.
 
@@ -641,11 +651,12 @@ async def _process_file(
                 # Trust a confident fingerprint outright; below the bar fall back to
                 # beets' text search rather than picking a weak audio match.
                 chosen = cands[0] if passes else _off_search_fallback(tag_result)
-            elif mode == ConfirmationMode.AUTO and passes and len(cands) == 1:
-                chosen = cands[0]  # lone, confident fingerprint: import silently
+            elif mode == ConfirmationMode.AUTO and passes and _is_dominant_top(cands):
+                # Confident top fingerprint that's clearly dominant: import silently.
+                chosen = cands[0]
             else:
-                # AUTO below the bar or with twins, and ON: prompt with the
-                # fingerprint set (a "Show all results" button reveals the text net).
+                # AUTO below the bar or ambiguous (twin / close contender), and ON:
+                # prompt the fingerprint set (a "Show all results" button reveals the text net).
                 chosen = await _confirm_looping(
                     bot, tg_id, file_id, filename, tag_result, file_path, states, report
                 )
@@ -657,10 +668,9 @@ async def _process_file(
             if mode == ConfirmationMode.OFF:
                 chosen = cands[0] if (is_high and cands) else "asis"
             elif mode == ConfirmationMode.AUTO and is_high and cands:
-                # Auto-import only a clearly-dominant top pick: no same-title twin
-                # AND no runner-up within 90% of its confidence. Otherwise prompt
-                # the full list (drop the recommendation to force the list layout).
-                if len(_top_twins(cands)) == 1 and not _has_close_contender(cands):
+                # Auto-import only a clearly-dominant top pick; otherwise prompt the
+                # full list (drop the recommendation to force the list layout).
+                if _is_dominant_top(cands):
                     chosen = cands[0]
                 else:
                     tag_result.recommendation = Recommendation.none

@@ -9,6 +9,7 @@ from src.handlers.upload import (
     _find_existing_track,
     _top_twins,
     _has_close_contender,
+    _is_dominant_top,
 )
 from src.library import album_owner_usernames, ensure_album_cover
 from src.models import Candidate, FileStatus
@@ -86,6 +87,26 @@ def test_has_close_contender_checks_any_runner_up():
         _c(2, "A", "T2", confidence=0.82),
     ]
     assert _has_close_contender(cands) is True
+
+
+def test_is_dominant_top_lone_candidate():
+    assert _is_dominant_top([_c(0, "A", "T", confidence=0.9)]) is True
+
+
+def test_is_dominant_top_clear_winner():
+    cands = [_c(0, "A", "T0", confidence=0.9), _c(1, "B", "T1", confidence=0.6)]
+    assert _is_dominant_top(cands) is True
+
+
+def test_is_dominant_top_false_on_twin():
+    # same artist/title, different disambig -> ambiguous even with a confidence gap
+    cands = [_c(0, "A", "T", "studio", confidence=0.9), _c(1, "A", "T", "live", confidence=0.5)]
+    assert _is_dominant_top(cands) is False
+
+
+def test_is_dominant_top_false_on_close_contender():
+    cands = [_c(0, "A", "T0", confidence=0.88), _c(1, "B", "T1", confidence=0.84)]
+    assert _is_dominant_top(cands) is False
 
 
 def _req(candidates, page=0):
