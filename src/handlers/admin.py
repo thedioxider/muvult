@@ -14,7 +14,6 @@ from ..db import Track, TrackOwnership, User, get_session
 from ..navidrome import NavidromeClient
 from ..pool import (
     _is_cover,
-    create_symlink,
     pool_rel,
     remove_pool_file,
     remove_symlink,
@@ -240,40 +239,12 @@ async def cmd_recreatelinks(message: Message) -> None:
     parts = (message.text or "").split()
     username = parts[1] if len(parts) > 1 else None
 
-    from ..config import settings
-    pool_root = Path(settings.music_root) / ".pool"
-
-    async with get_session() as session:
-        if username:
-            result = await session.exec(select(User).where(User.username == username))
-            users = [result.first()]
-            if not users[0]:
-                await message.answer(f"No user: {username}")
-                return
-        else:
-            result = await session.exec(select(User))
-            users = result.all()
-
-        count = 0
-        missing = []
-        for user in users:
-            user_dir = Path(settings.music_root) / user.username
-            own_result = await session.exec(
-                select(TrackOwnership, Track)
-                .join(Track, Track.id == TrackOwnership.track_id)
-                .where(TrackOwnership.user_id == user.id)
-            )
-            for ownership, track in own_result.all():
-                pool_file = pool_root / track.pool_path
-                if not pool_file.exists():
-                    missing.append(track.pool_path)
-                    continue
-                remove_symlink(Path(ownership.symlink_path))
-                new_link = create_symlink(pool_file, user_dir, flat=track.is_asis)
-                ownership.symlink_path = str(new_link)
-                count += 1
-
-        await session.commit()
+    from ..library import recreate_links
+    result = await recreate_links(username)
+    if result is None:
+        await message.answer(f"No user: {username}")
+        return
+    count, missing = result
 
     target = username or "all users"
     msg = f"Recreated {count} symlink(s) for {target}"

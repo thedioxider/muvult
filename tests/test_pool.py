@@ -4,7 +4,12 @@ from src.pool import (
     create_symlink,
     ensure_cover_symlink,
     find_cover,
+    find_sidecars,
+    links_to,
     promote_pool_file,
+    reconcile_sidecars,
+    remove_link_sidecars,
+    remove_sidecars,
     remove_symlink,
     remove_pool_file,
     update_symlinks,
@@ -185,6 +190,108 @@ def test_remove_pool_file_keeps_cover_when_tracks_remain(dirs):
     assert not pool_file.exists()
     assert cover.exists()  # another track remains -> cover stays
     assert keep.exists()
+
+
+def test_find_sidecars_exact_stem_only(dirs):
+    pool_dir, user_dir, root = dirs
+    track = pool_dir / "01 - Song.flac"
+    track.write_bytes(b"audio")
+    (pool_dir / "01 - Song.lrc").write_text("synced")
+    (pool_dir / "01 - Song.txt").write_text("plain")
+    (pool_dir / "01 - Song.en.lrc").write_text("infix")  # not exact stem -> excluded
+    (pool_dir / "02 - Other.lrc").write_text("other")     # other track -> excluded
+    (pool_dir / "front.jpg").write_bytes(b"img")          # not a lyrics ext
+
+    names = {p.name for p in find_sidecars(track)}
+    assert names == {"01 - Song.lrc", "01 - Song.txt"}
+
+
+def test_create_symlink_links_sidecars(dirs):
+    pool_dir, user_dir, root = dirs
+    track = pool_dir / "01 - Song.mp3"
+    track.write_bytes(b"audio")
+    (pool_dir / "01 - Song.lrc").write_text("synced")
+
+    link = create_symlink(track, user_dir)
+
+    sidecar_link = link.parent / "01 - Song.lrc"
+    assert sidecar_link.is_symlink()
+    assert sidecar_link.resolve() == (pool_dir / "01 - Song.lrc").resolve()
+
+
+def test_remove_symlink_takes_lyrics(dirs):
+    pool_dir, user_dir, root = dirs
+    track = pool_dir / "01 - Song.mp3"
+    track.write_bytes(b"audio")
+    (pool_dir / "01 - Song.lrc").write_text("synced")
+    link = create_symlink(track, user_dir)
+    # a real lyrics file a plugin dropped next to the track link
+    plugin_file = link.parent / "01 - Song.txt"
+    plugin_file.write_text("plugin lyrics")
+
+    remove_symlink(link, library_root=user_dir)
+
+    assert not link.exists()
+    assert not (user_dir / "Artist" / "Album" / "01 - Song.lrc").exists()
+    assert not plugin_file.exists()          # real plugin file taken too
+    assert (pool_dir / "01 - Song.lrc").exists()  # pool sidecar untouched
+    assert not (user_dir / "Artist").exists()     # dir pruned
+
+
+def test_remove_pool_file_takes_pool_sidecars(dirs):
+    pool_dir, user_dir, root = dirs
+    track = pool_dir / "01 - Song.mp3"
+    track.write_bytes(b"audio")
+    lrc = pool_dir / "01 - Song.lrc"
+    lrc.write_text("synced")
+
+    remove_pool_file(track)
+
+    assert not track.exists()
+    assert not lrc.exists()
+    assert not pool_dir.exists()  # last track + its lyrics gone -> dir pruned
+
+
+def test_reconcile_sidecars_links_missing_and_removes_extra(dirs):
+    pool_dir, user_dir, root = dirs
+    track = pool_dir / "01 - Song.mp3"
+    track.write_bytes(b"audio")
+    (pool_dir / "01 - Song.lrc").write_text("pooled")
+    album = user_dir / "Artist" / "Album"
+    album.mkdir(parents=True)
+    # a stale library lyrics entry with no pool counterpart
+    stale = album / "01 - Song.txt"
+    stale.write_text("stale plugin lyrics")
+
+    reconcile_sidecars(track, album)
+
+    assert not stale.exists()                       # no pool counterpart -> removed
+    assert (album / "01 - Song.lrc").is_symlink()   # pool sidecar -> linked
+
+
+def test_reconcile_sidecars_is_noop_when_in_sync(dirs):
+    pool_dir, user_dir, root = dirs
+    track = pool_dir / "01 - Song.mp3"
+    track.write_bytes(b"audio")
+    (pool_dir / "01 - Song.lrc").write_text("pooled")
+    link = create_symlink(track, user_dir)
+    sidecar_link = link.parent / "01 - Song.lrc"
+    before = sidecar_link.lstat().st_ino
+
+    reconcile_sidecars(track, link.parent)
+
+    assert sidecar_link.lstat().st_ino == before  # untouched -> not rewritten
+
+
+def test_links_to(dirs):
+    pool_dir, user_dir, root = dirs
+    track = pool_dir / "01 - Song.mp3"
+    track.write_bytes(b"audio")
+    link = create_symlink(track, user_dir)
+    assert links_to(link, track)
+    other = pool_dir / "02 - Other.mp3"
+    other.write_bytes(b"audio")
+    assert not links_to(link, other)
 
 
 def test_update_symlinks(dirs):
