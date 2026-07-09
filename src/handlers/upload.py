@@ -92,7 +92,7 @@ _PROMPT_MIN_HOLD_SECONDS = 0.5  # floor pause after an answer before the next pr
 # human look. In AUTO a lone match at/above it auto-imports (below it prompts); in
 # OFF a match at/above it is picked outright, and below it we fall back to beets'
 # text search (the fingerprint is deemed too weak to be authoritative).
-_FP_CONFIDENCE_THRESHOLD = 0.80
+_FP_CONFIDENCE_THRESHOLD = 0.85
 
 
 def _get_batch_lock(tg_id: int) -> asyncio.Lock:
@@ -327,16 +327,29 @@ def _top_twins(candidates: list) -> list:
     ]
 
 
-def _reindexed(candidates: list[Candidate]) -> list[Candidate]:
-    """Copies of ``candidates`` renumbered 0..n so ``.index`` matches position.
+_AUTO_CONTENDER_RATIO = 0.90  # a runner-up this close to the top's confidence is a contender
 
-    A prompt built from a sublist (e.g. ``_top_twins``) must have its buttons carry
-    positions in *that* list, since the callback resolves a pick against the list in
-    view. Copies (not in-place) so the originals' indices are left untouched.
+
+def _has_close_contender(candidates: list[Candidate]) -> bool:
+    """True if a non-top candidate's confidence is >= 90% of the top's.
+
+    Candidates are confidence-sorted, so a near-tie behind the top pick means even
+    a strong beets recommendation isn't decisive enough to import without asking.
     """
-    from dataclasses import replace
+    if len(candidates) < 2:
+        return False
+    cutoff = candidates[0].confidence * _AUTO_CONTENDER_RATIO
+    return any(c.confidence >= cutoff for c in candidates[1:])
 
-    return [replace(c, index=i) for i, c in enumerate(candidates)]
+
+def _is_dominant_top(candidates: list[Candidate]) -> bool:
+    """True when candidate #0 is clear enough to auto-import in AUTO mode.
+
+    Dominant means unambiguous: no same-title twin (`_top_twins`) and no runner-up
+    within 90% of #0's confidence (`_has_close_contender`). Shared by the text and
+    fingerprint AUTO paths; a lone candidate is the trivial dominant case.
+    """
+    return len(_top_twins(candidates)) == 1 and not _has_close_contender(candidates)
 
 
 def _off_search_fallback(tag_result: TagResult) -> "Candidate | str":
@@ -638,11 +651,12 @@ async def _process_file(
                 # Trust a confident fingerprint outright; below the bar fall back to
                 # beets' text search rather than picking a weak audio match.
                 chosen = cands[0] if passes else _off_search_fallback(tag_result)
-            elif mode == ConfirmationMode.AUTO and passes and len(cands) == 1:
-                chosen = cands[0]  # lone, confident fingerprint: import silently
+            elif mode == ConfirmationMode.AUTO and passes and _is_dominant_top(cands):
+                # Confident top fingerprint that's clearly dominant: import silently.
+                chosen = cands[0]
             else:
-                # AUTO below the bar or with twins, and ON: prompt with the
-                # fingerprint set (a "Show all results" button reveals the text net).
+                # AUTO below the bar or ambiguous (twin / close contender), and ON:
+                # prompt the fingerprint set (a "Show all results" button reveals the text net).
                 chosen = await _confirm_looping(
                     bot, tg_id, file_id, filename, tag_result, file_path, states, report
                 )
@@ -654,14 +668,14 @@ async def _process_file(
             if mode == ConfirmationMode.OFF:
                 chosen = cands[0] if (is_high and cands) else "asis"
             elif mode == ConfirmationMode.AUTO and is_high and cands:
-                group = _top_twins(cands)
-                if len(group) == 1:
-                    chosen = group[0]
+                # Auto-import only a clearly-dominant top pick; otherwise prompt the
+                # full list (drop the recommendation to force the list layout).
+                if _is_dominant_top(cands):
+                    chosen = cands[0]
                 else:
+                    tag_result.recommendation = Recommendation.none
                     chosen = await _confirm_looping(
-                        bot, tg_id, file_id, filename,
-                        TagResult(candidates=_reindexed(group), recommendation=Recommendation.none),
-                        file_path, states, report,
+                        bot, tg_id, file_id, filename, tag_result, file_path, states, report,
                     )
             else:
                 chosen = await _confirm_looping(
