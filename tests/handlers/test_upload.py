@@ -8,9 +8,8 @@ from src.handlers.upload import (
     FileState,
     _find_existing_track,
     _top_twins,
-    _album_owner_usernames,
-    _ensure_album_cover,
 )
+from src.library import album_owner_usernames, ensure_album_cover
 from src.models import Candidate, FileStatus
 from src.db import init_db, get_session, Track, TrackOwnership, User
 from src.pool import create_symlink, find_cover
@@ -326,7 +325,7 @@ async def test_album_owner_usernames_collects_only_album_owners(tmp_path):
     await init_db(str(tmp_path / "db"))
     await _seed_owners()
     async with get_session() as s:
-        names = await _album_owner_usernames(s, "Artist/Album")
+        names = await album_owner_usernames(s, "Artist/Album")
     assert set(names) == {"alice", "bob"}  # carol's unrelated album excluded
 
 
@@ -339,8 +338,8 @@ async def test_ensure_album_cover_fetches_once_and_fans_out(tmp_path):
 
     fetch = AsyncMock(return_value=(b"IMGDATA", ".png"))
     with patch("src.config.settings", MagicMock(music_root=str(music_root))), \
-         patch("src.handlers.upload.fetch_cover_art_full", fetch):
-        await _ensure_album_cover("rg-1", pool_file)
+         patch("src.library.fetch_cover_art_full", fetch):
+        await ensure_album_cover("rg-1", pool_file)
 
     fetch.assert_awaited_once_with("rg-1")
     pool_cover = pool_dir / "front.png"
@@ -361,8 +360,8 @@ async def test_ensure_album_cover_skips_fetch_when_pool_cover_exists(tmp_path):
 
     fetch = AsyncMock()
     with patch("src.config.settings", MagicMock(music_root=str(music_root))), \
-         patch("src.handlers.upload.fetch_cover_art_full", fetch):
-        await _ensure_album_cover("rg-1", pool_file)
+         patch("src.library.fetch_cover_art_full", fetch):
+        await ensure_album_cover("rg-1", pool_file)
 
     fetch.assert_not_awaited()  # no refetch when a cover is already present
     assert find_cover(album_dirs["alice"]) == album_dirs["alice"] / "front.jpg"
@@ -376,8 +375,8 @@ async def test_ensure_album_cover_noop_when_fetch_fails(tmp_path):
     pool_file = pool_dir / "01 - A.mp3"
 
     with patch("src.config.settings", MagicMock(music_root=str(music_root))), \
-         patch("src.handlers.upload.fetch_cover_art_full", AsyncMock(return_value=None)):
-        await _ensure_album_cover("rg-1", pool_file)
+         patch("src.library.fetch_cover_art_full", AsyncMock(return_value=None)):
+        await ensure_album_cover("rg-1", pool_file)
 
     assert find_cover(pool_dir) is None  # nothing written
     assert find_cover(album_dirs["alice"]) is None  # nothing linked

@@ -267,6 +267,22 @@ async def apply_and_stage(
     return await loop.run_in_executor(_beets_pool, _apply_and_stage_sync, file_path, candidate, enrich)
 
 
+async def retag_by_id(
+    file_path: Path, mb_track_id: str, enrich: bool = True
+) -> tuple[Path, Path]:
+    """Re-tag a file from a known MusicBrainz recording id (no search).
+
+    Reuses the import path (``_apply_and_stage_sync``) with a bare candidate, so
+    metadata, enrichment and the embedded cover are refreshed exactly as on import.
+    Raises ``LookupError`` if the recording can't be fetched (no search fallback)."""
+    candidate = Candidate(
+        index=0, artist="", title="", album="", year=None,
+        mb_track_id=mb_track_id, distance=0.0, _match=None,
+    )
+    loop = get_running_loop()
+    return await loop.run_in_executor(_beets_pool, _apply_and_stage_sync, file_path, candidate, enrich)
+
+
 def _status_rank(status: str | None) -> int:
     return {"Official": 2, "Pseudo-Release": 1}.get(status or "", 0)
 
@@ -543,6 +559,18 @@ def _embed_cover_art(file_path: Path, rgid: str) -> None:
         log.debug("cover art embed failed for %s", file_path)
 
 
+def _write_subtitle(file_path: Path, subtitle: str) -> None:
+    """Set (or clear) the file's subtitle tag, best-effort."""
+    try:
+        from mediafile import MediaFile
+
+        mf = MediaFile(str(file_path))
+        mf.subtitle = subtitle or None
+        mf.save()
+    except Exception:
+        log.debug("subtitle write failed for %s", file_path)
+
+
 def _tag_acoustid(item: Item) -> None:
     """Stamp the file with its AcoustID id, if we fingerprinted it.
 
@@ -610,6 +638,10 @@ def _apply_and_stage_sync(
         item.update(track_info.item_data)
         track_artist = track_info.artist
         releases = rec.get("releases") or []
+    elif candidate._match is None:
+        # No search-level fallback available (a re-tag by bare id). The caller can't
+        # sensibly proceed without authoritative metadata -- surface the miss.
+        raise LookupError(f"recording {candidate.mb_track_id} lookup failed")
     else:  # lookup failed: fall back to the search-level candidate metadata
         info = candidate._match.info
         item.update(info.item_data)
@@ -628,15 +660,13 @@ def _apply_and_stage_sync(
     # left with an entry pointing at the (transient) staging path. delete=False
     # keeps the file on disk.
     item.remove(delete=False)
-    # Surface the recording disambiguation in the title *tag* so tag-reading players
-    # (Navidrome) show e.g. "Aerials (live, 2005-06-12: Download Festival, ...)"
-    # instead of a bare "Aerials" that looks identical to the studio take. dest was
-    # already computed above from the untouched title. Idempotent on re-upload: the
-    # title is reset to the clean recording title by item.update before we append.
-    if disambig := (item.trackdisambig or "").strip():
-        item.title = f"{item.title} ({disambig})"
     _tag_acoustid(item)
     item.write(path=str(file_path))
+    # Recording disambiguation lives in the subtitle tag: Navidrome shows it and keys
+    # ND_PID_TRACK (albumartistid,title,subtitle) on it, so a distinct recording of
+    # the same track stays distinct while the title stays bare and scrobbles match.
+    # Always set/cleared so a re-tag never leaves a stale subtitle.
+    _write_subtitle(file_path, (item.trackdisambig or "").strip())
     # Cover art rides on album identity: embed the release group's front image so a
     # symlinked pool (no per-album folder to drop a cover in) still shows art.
     if enriched and (rgid := enriched.get("mb_releasegroupid")):

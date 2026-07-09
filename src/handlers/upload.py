@@ -14,17 +14,14 @@ from sqlmodel import select
 
 from beets.autotag.match import Recommendation
 
-from ..beets_svc import get_candidates, apply_and_stage, stage_as_is, normalize_title, fetch_cover_art_full
+from ..beets_svc import get_candidates, apply_and_stage, stage_as_is, normalize_title
 from ..db import Track, TrackOwnership, User, get_session
+from ..library import ensure_album_cover, promote_and_relink
 from ..models import Candidate, ConfirmationMode, FileStatus, TagResult
 from ..pool import (
     create_symlink,
-    ensure_cover_symlink,
-    find_cover,
     pool_rel,
     promote_pool_file,
-    remove_pool_file,
-    update_symlinks,
 )
 from ..quality import is_better
 from ..tg_utils import safe_answer
@@ -305,59 +302,6 @@ async def _find_existing_track(session, mb_id: str | None, pool_path: str):
         result = await session.exec(select(Track).where(Track.musicbrainz_id == mb_id))
         return result.first()
     return None
-
-
-async def _album_owner_usernames(session, rel_album: str) -> list[str]:
-    """Usernames of every user owning any track in the given album folder.
-
-    ``rel_album`` is the album dir relative to the pool root (``<albumartist>/
-    <album>``); tracks are matched by that path prefix. Drives the cover fan-out
-    so a newly-created album cover is linked into all current owners' libraries."""
-    prefix = rel_album + "/"
-    tracks = (
-        await session.exec(select(Track).where(Track.pool_path.startswith(prefix, autoescape=True)))
-    ).all()
-    track_ids = [t.id for t in tracks]
-    if not track_ids:
-        return []
-    owns = (
-        await session.exec(select(TrackOwnership).where(TrackOwnership.track_id.in_(track_ids)))
-    ).all()
-    user_ids = {o.user_id for o in owns}
-    if not user_ids:
-        return []
-    users = (await session.exec(select(User).where(User.id.in_(user_ids)))).all()
-    return [u.username for u in users]
-
-
-async def _ensure_album_cover(rgid: str, pool_file: Path) -> None:
-    """Fetch (once) and link the album's full-res folder cover into every owner.
-
-    The pool holds one real ``front.<ext>`` per album (fetched from the CAA on
-    first need); each owner's album folder gets a relative symlink to it, which
-    Navidrome prefers over the embedded 500px art. Fanning out to *all* current
-    owners -- not just the uploader -- means a user who imported the album while
-    art was missing gets covered the moment anyone re-triggers the fetch. Every
-    step is idempotent, so duplicates and re-uploads self-heal missing links."""
-    from ..config import settings
-
-    music_root = Path(settings.music_root)
-    album_dir = pool_file.parent
-    rel_album = str(Path(pool_rel(pool_file)).parent)
-    cover = find_cover(album_dir)
-    if cover is None:
-        result = await fetch_cover_art_full(rgid)
-        if result is None:
-            return
-        data, ext = result
-        cover = find_cover(album_dir)  # re-check: a concurrent import may have won
-        if cover is None:
-            cover = album_dir / f"front{ext}"
-            cover.write_bytes(data)
-    async with get_session() as session:
-        usernames = await _album_owner_usernames(session, rel_album)
-    for uname in usernames:
-        ensure_cover_symlink(cover, music_root / uname / rel_album)
 
 
 def _top_twins(candidates: list) -> list:
@@ -765,20 +709,9 @@ async def _process_file(
                 # same-quality re-upload no longer overwrites (so it no longer
                 # refreshes tags); a strictly worse one likewise loses.
                 if is_upgrade or not old_pool.exists():
-                    pool_file = promote_pool_file(staged, dest)
-                    if pool_file != old_pool:
-                        own_result = await session.exec(
-                            select(TrackOwnership).where(TrackOwnership.track_id == existing.id)
-                        )
-                        ownerships = own_result.all()
-                        old_links = [Path(o.symlink_path) for o in ownerships]
-                        new_links = update_symlinks(old_pool, pool_file, old_links)
-                        remove_pool_file(old_pool)
-                        for ownership, new_l in zip(ownerships, new_links):
-                            ownership.symlink_path = str(new_l)
+                    pool_file = await promote_and_relink(session, pool_root, existing, staged, dest)
                     if is_upgrade:
                         note = f"{existing.format.upper()} {existing.bitrate}kbps → {new_format.upper()} {new_bitrate}kbps"
-                    existing.pool_path = pool_rel(pool_file)
                     existing.musicbrainz_id = mb_id  # may have changed (better MB match)
                     existing.bitrate = new_bitrate
                     existing.format = new_format
@@ -814,7 +747,7 @@ async def _process_file(
         # import. Idempotent -- safe on duplicates, which self-heal a missing link.
         if rgid:
             try:
-                await _ensure_album_cover(rgid, pool_file)
+                await ensure_album_cover(rgid, pool_file)
             except Exception:
                 log.debug("cover art linking failed for %s", pool_rel(pool_file))
 
