@@ -3,7 +3,10 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 from sqlmodel import select
-from src.handlers.admin import cmd_adduser, cmd_users, cmd_settgid, cmd_recreatelinks
+from src.handlers.admin import (
+    cmd_adduser, cmd_users, cmd_settgid, cmd_recreatelinks,
+    _resolve_retag_scope, _run_retag,
+)
 from src.db import init_db, get_session, Track, TrackOwnership, User
 
 
@@ -111,3 +114,74 @@ async def test_recreatelinks_relinks_asis_flat(tmp_path):
     async with get_session() as s:
         own = (await s.exec(select(TrackOwnership))).first()
         assert Path(own.symlink_path) == flat_link
+
+
+async def _seed_retag_tracks():
+    async with get_session() as s:
+        s.add(Track(id=1, pool_path="Ar/Al1/a.mp3", musicbrainz_id="m1", format="flac", bitrate=1000))
+        s.add(Track(id=2, pool_path="Ar/Al1/b.mp3", musicbrainz_id="m2", format="flac", bitrate=1000))
+        s.add(Track(id=3, pool_path="Ar/Al2/c.mp3", musicbrainz_id="m3", format="flac", bitrate=1000))
+        s.add(Track(id=4, pool_path="Ar/Al2/d.mp3", musicbrainz_id=None, format="mp3", bitrate=320))
+        await s.commit()
+
+
+@pytest.mark.asyncio
+async def test_resolve_retag_scope_variants(tmp_path):
+    await init_db(str(tmp_path / "db"))
+    await _seed_retag_tracks()
+
+    # No arg -> whole library (only tagged rows); covers every touched album.
+    ids, covers, albums = await _resolve_retag_scope(None)
+    assert set(ids) == {1, 2, 3}
+    assert covers == {"Ar/Al1", "Ar/Al2"} == albums
+
+    # prefix/* -> that subtree, cover refetch on.
+    ids, covers, albums = await _resolve_retag_scope("Ar/Al1/*")
+    assert set(ids) == {1, 2} and covers == {"Ar/Al1"} == albums
+
+    # untagged rows are excluded even under a matching prefix.
+    ids, _, _ = await _resolve_retag_scope("Ar/Al2/*")
+    assert set(ids) == {3}
+
+    # Exact track path -> that one track, no cover refetch.
+    ids, covers, albums = await _resolve_retag_scope("Ar/Al1/a.mp3")
+    assert ids == [1] and covers == set() and albums == {"Ar/Al1"}
+
+    # Bare front.<ext> -> cover-only refetch, no tracks, no confirm.
+    ids, covers, albums = await _resolve_retag_scope("Ar/Al1/front.jpg")
+    assert ids == [] and covers == {"Ar/Al1"} and albums == set()
+
+    # Malformed wildcard (traversal in the prefix) -> None.
+    assert await _resolve_retag_scope("../*") is None
+
+
+@pytest.mark.asyncio
+async def test_run_retag_clash_keeps_file_in_place(tmp_path):
+    # When a re-tag resolves to a path another track already holds, the file is
+    # re-tagged in place (dest redirected to its current path) rather than moved
+    # onto -- and overwriting -- the other track.
+    await init_db(str(tmp_path / "db"))
+    await _seed_retag_tracks()
+    music_root = tmp_path / "music"
+    pool_root = music_root / ".pool"
+    (pool_root / "Ar/Al1").mkdir(parents=True)
+    (pool_root / "Ar/Al1/a.mp3").write_bytes(b"audio-a")
+
+    # retag of track 1 (a.mp3) resolves to b.mp3's canonical path -- a clash.
+    async def fake_retag(tmp, mb_id, enrich=True):
+        return tmp, pool_root / "Ar/Al1/b.mp3"
+
+    seen = {}
+    async def fake_promote(session, proot, track, staged, dest):
+        seen["dest"] = dest
+        return dest
+
+    settings = MagicMock(music_root=str(music_root), staging_root=str(tmp_path / "staging"))
+    with patch("src.config.settings", settings), \
+         patch("src.beets_svc.retag_by_id", fake_retag), \
+         patch("src.library.promote_and_relink", fake_promote), \
+         patch("src.library.ensure_album_cover", AsyncMock()):
+        summary = await _run_retag(AsyncMock(), [1], [])
+
+    assert seen["dest"] == pool_root / "Ar/Al1/a.mp3"  # kept in place, not b.mp3
+    assert "Re-tagged 1 track(s)" in summary

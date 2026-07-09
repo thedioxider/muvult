@@ -19,10 +19,10 @@ then filed into a shared pool and linked into the uploader's library:
 - **Pool** -- `<music root>/.pool/` holds exactly one file per track, named
   `$albumartist/$album/$title`, with a track disambiguation folded in when present
   (`.../arrow (live)`) so a distinct recording of the same track gets its own
-  location. This is the only real copy. The disambiguation is also appended to the
-  file's **title tag** (`Aerials (live, ...)`), so a live or alternate take is
-  distinguishable in Navidrome instead of showing a bare title identical to the
-  studio recording.
+  location. This is the only real copy. The disambiguation is also written to the
+  file's **subtitle tag** (`live, ...`) -- Navidrome shows it and can key its track
+  PID on it, while the title stays the bare recording title so scrobbles match the
+  studio recording instead of a disambiguated variant.
 - **Libraries** -- each user has a directory `<music root>/<username>/`
   containing _symlinks_ into the pool. Navidrome scans these per-user dirs, one
   library per user (its path is `ND_MUSIC_PATH/<username>`).
@@ -135,6 +135,9 @@ strength comes from beets' own match recommendation:
 - `/users` -- list registered users
 - `/recreatelinks [username]` -- rebuild symlinks from the DB (repair tool)
 - `/removetrack <path|prefix/*> [username]` -- remove tracks by pool path
+- `/retag [path|prefix/*]` -- re-fetch tags/album/cover for matched tracks by their
+  stored MusicBrainz id; no argument re-tags the whole library. A `.../*` wildcard or
+  a `front.<ext>` path also refreshes the album cover. Confirms when spanning >1 album.
 
 ## Configuration
 
@@ -214,4 +217,5 @@ Tests use `pytest-asyncio` (auto mode) and `respx` to mock Navidrome's HTTP API.
 | `src/beets_patches.py`   | MusicBrainz search reshaping patch                     |
 | `src/navidrome.py`       | Navidrome admin API client                             |
 | `src/pool.py`            | Pool paths, symlink create/update/remove               |
+| `src/library.py`         | Shared pool/ownership glue (promote+relink, covers)    |
 | `src/quality.py`         | Bitrate/format comparison for upgrades                 |

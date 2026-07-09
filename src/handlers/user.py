@@ -27,7 +27,8 @@ _ADMIN_SECTION = (
     "/setusername [old] [new]\n"
     "/users\n"
     "/recreatelinks [username]\n"
-    "/removetrack [path|prefix/*] [username]"
+    "/removetrack [path|prefix/*] [username]\n"
+    "/retag [path|prefix/*|empty for whole library]"
 )
 
 

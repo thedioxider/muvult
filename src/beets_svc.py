@@ -267,6 +267,22 @@ async def apply_and_stage(
     return await loop.run_in_executor(_beets_pool, _apply_and_stage_sync, file_path, candidate, enrich)
 
 
+async def retag_by_id(
+    file_path: Path, mb_track_id: str, enrich: bool = True
+) -> tuple[Path, Path]:
+    """Re-tag a file from a known MusicBrainz recording id (no search).
+
+    Reuses the import path (``_apply_and_stage_sync``) with a bare candidate, so
+    metadata, enrichment and the embedded cover are refreshed exactly as on import.
+    Raises ``LookupError`` if the recording can't be fetched (no search fallback)."""
+    candidate = Candidate(
+        index=0, artist="", title="", album="", year=None,
+        mb_track_id=mb_track_id, distance=0.0, _match=None,
+    )
+    loop = get_running_loop()
+    return await loop.run_in_executor(_beets_pool, _apply_and_stage_sync, file_path, candidate, enrich)
+
+
 def _status_rank(status: str | None) -> int:
     return {"Official": 2, "Pseudo-Release": 1}.get(status or "", 0)
 
@@ -622,6 +638,10 @@ def _apply_and_stage_sync(
         item.update(track_info.item_data)
         track_artist = track_info.artist
         releases = rec.get("releases") or []
+    elif candidate._match is None:
+        # No search-level fallback available (a re-tag by bare id). The caller can't
+        # sensibly proceed without authoritative metadata -- surface the miss.
+        raise LookupError(f"recording {candidate.mb_track_id} lookup failed")
     else:  # lookup failed: fall back to the search-level candidate metadata
         info = candidate._match.info
         item.update(info.item_data)

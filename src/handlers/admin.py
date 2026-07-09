@@ -12,7 +12,14 @@ from sqlmodel import select
 
 from ..db import Track, TrackOwnership, User, get_session
 from ..navidrome import NavidromeClient
-from ..pool import create_symlink, remove_pool_file, remove_symlink, user_library_root
+from ..pool import (
+    _is_cover,
+    create_symlink,
+    pool_rel,
+    remove_pool_file,
+    remove_symlink,
+    user_library_root,
+)
 from ..tg_utils import safe_answer
 
 
@@ -419,6 +426,155 @@ async def cmd_removetrack(message: Message) -> None:
         base + f"\n{len(orphaned)} track(s) now have no owners. Delete from pool and DB?",
         reply_markup=_orphan_keyboard(key),
     )
+
+
+_pending_retags: dict[str, dict[str, Any]] = {}
+
+
+def _album_rgid(album_dir: Path) -> str | None:
+    """Release-group id read from any audio file in an album dir."""
+    try:
+        from beets import mediafile as mf_lib
+        for e in album_dir.iterdir():
+            if e.is_file() and not _is_cover(e) and (rgid := mf_lib.MediaFile(str(e)).mb_releasegroupid):
+                return rgid
+    except Exception:
+        pass
+    return None
+
+
+async def _resolve_retag_scope(raw: str | None):
+    """``(track_ids, cover_dirs, track_albums)`` for a /retag arg, or ``None`` if the
+    wildcard is invalid. Re-taggable rows carry a ``musicbrainz_id``; ``cover_dirs``
+    (empty => no refetch) are albums whose folder cover to refresh; ``track_albums``
+    drives the confirm gate. No arg -> whole library; ``prefix/*`` -> that subtree;
+    a bare ``front.<ext>`` -> that album's cover only; else an exact track path."""
+    async with get_session() as session:
+        rows = [t for t in (await session.exec(select(Track))).all() if t.musicbrainz_id]
+    if raw is None:
+        tracks, refetch = rows, True
+    elif raw.endswith("/*"):
+        prefix = _parse_wildcard_prefix(raw)
+        if prefix is None:
+            return None
+        tracks, refetch = [t for t in rows if t.pool_path.startswith(prefix + "/")], True
+    elif _is_cover(Path(raw)):
+        return [], {str(Path(raw).parent)}, set()
+    else:
+        tracks, refetch = [t for t in rows if t.pool_path == raw], False
+    albums = {str(Path(t.pool_path).parent) for t in tracks}
+    return [t.id for t in tracks], (albums if refetch else set()), albums
+
+
+def _retag_keyboard(key: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Yes, re-tag", callback_data=f"retag_go:{key}:yes"),
+        InlineKeyboardButton(text="No", callback_data=f"retag_go:{key}:no"),
+    ]])
+
+
+async def _safe_edit(msg: Message, text: str) -> None:
+    try:
+        await msg.edit_text(text)
+    except Exception:  # unchanged text / transient edit -- progress is best-effort
+        pass
+
+
+async def _run_retag(status: Message, track_ids: list[int], cover_dirs: list[str]) -> str:
+    """Re-tag each track by its stored MB id (fresh metadata + enrichment), then
+    refresh ``cover_dirs`` album covers. Edits ``status`` with progress."""
+    from ..config import settings
+    from ..beets_svc import retag_by_id
+    from ..library import ensure_album_cover, promote_and_relink
+
+    pool_root = Path(settings.music_root) / ".pool"
+    staging = Path(settings.staging_root) / "retag"
+    staging.mkdir(parents=True, exist_ok=True)
+    total, done, failed, covers = len(track_ids), 0, 0, 0
+
+    for i, tid in enumerate(track_ids, 1):
+        async with get_session() as session:
+            track = (await session.exec(select(Track).where(Track.id == tid))).first()
+            if track is None:
+                continue
+            tmp = staging / f"{tid}_{Path(track.pool_path).name}"
+            try:
+                shutil.copy2(pool_root / track.pool_path, tmp)
+                staged, dest = await retag_by_id(tmp, track.musicbrainz_id, enrich=True)
+                # If the refreshed path already belongs to another row, keep this file
+                # where it is (re-tagged in place) rather than moving onto -- and
+                # overwriting -- that track. Tags still get refreshed; only the move is
+                # skipped.
+                new_rel = pool_rel(dest)
+                if new_rel != track.pool_path and (await session.exec(
+                    select(Track).where(Track.pool_path == new_rel, Track.id != tid)
+                )).first() is not None:
+                    dest = pool_root / track.pool_path
+                await promote_and_relink(session, pool_root, track, staged, dest)
+                await session.commit()
+                done += 1
+            except Exception:
+                log.exception("retag failed for %s", track.pool_path)
+                failed += 1
+                tmp.unlink(missing_ok=True)
+        if i % 5 == 0 or i == total:
+            await _safe_edit(status, f"Re-tagging… {i}/{total}" + (f" ({failed} failed)" if failed else ""))
+
+    for album in cover_dirs:
+        if rgid := _album_rgid(pool_root / album):
+            try:
+                await ensure_album_cover(rgid, pool_root / album / "_anchor", force=True)
+                covers += 1
+            except Exception:
+                log.debug("cover refetch failed for %s", album)
+
+    parts = [f"Re-tagged {done} track(s)"]
+    if failed:
+        parts.append(f"{failed} failed")
+    if cover_dirs:
+        parts.append(f"{covers} cover(s) refreshed")
+    return ", ".join(parts) + "."
+
+
+@admin_router.message(Command("retag"))
+async def cmd_retag(message: Message) -> None:
+    try:
+        args = shlex.split((message.text or "").split(" ", 1)[1] if " " in (message.text or "") else "")
+    except ValueError:
+        await message.answer("Invalid syntax (unclosed quote?)")
+        return
+    scope = await _resolve_retag_scope(args[0] if args else None)
+    if scope is None:
+        await message.answer("Invalid wildcard. Use an exact path, prefix/*, or no argument for the whole library.")
+        return
+    track_ids, cover_dirs, track_albums = scope
+    if not track_ids and not cover_dirs:
+        await message.answer("Nothing to re-tag.")
+        return
+
+    summary = f"{len(track_ids)} track(s)" + (f" + {len(cover_dirs)} cover(s)" if cover_dirs else "")
+    if len(track_albums) > 1:  # confirm only when spanning more than one album
+        key = secrets.token_hex(6)
+        _pending_retags[key] = {"track_ids": track_ids, "cover_dirs": list(cover_dirs)}
+        await message.answer(f"Re-tag {summary} across {len(track_albums)} albums?", reply_markup=_retag_keyboard(key))
+        return
+    status = await message.answer(f"Re-tagging {summary}…")
+    await _safe_edit(status, await _run_retag(status, track_ids, list(cover_dirs)))
+
+
+@admin_router.callback_query(lambda c: c.data and c.data.startswith("retag_go:"))
+async def cb_retag(callback: CallbackQuery) -> None:
+    _, key, choice = callback.data.split(":", 2)
+    payload = _pending_retags.pop(key, None)
+    if payload is None:
+        await callback.message.edit_text(callback.message.text + "\n\n(Expired)")
+    elif choice != "yes":
+        await callback.message.edit_text(callback.message.text + "\n\nCancelled.")
+    else:
+        await callback.message.edit_text(callback.message.text + "\n\nRe-tagging…")
+        result = await _run_retag(callback.message, payload["track_ids"], payload["cover_dirs"])
+        await _safe_edit(callback.message, result)
+    await safe_answer(callback)
 
 
 @admin_router.message(Command("users"))
