@@ -327,16 +327,19 @@ def _top_twins(candidates: list) -> list:
     ]
 
 
-def _reindexed(candidates: list[Candidate]) -> list[Candidate]:
-    """Copies of ``candidates`` renumbered 0..n so ``.index`` matches position.
+_AUTO_CONTENDER_RATIO = 0.90  # a runner-up this close to the top's confidence is a contender
 
-    A prompt built from a sublist (e.g. ``_top_twins``) must have its buttons carry
-    positions in *that* list, since the callback resolves a pick against the list in
-    view. Copies (not in-place) so the originals' indices are left untouched.
+
+def _has_close_contender(candidates: list[Candidate]) -> bool:
+    """True if a non-top candidate's confidence is >= 90% of the top's.
+
+    Candidates are confidence-sorted, so a near-tie behind the top pick means even
+    a strong beets recommendation isn't decisive enough to import without asking.
     """
-    from dataclasses import replace
-
-    return [replace(c, index=i) for i, c in enumerate(candidates)]
+    if len(candidates) < 2:
+        return False
+    cutoff = candidates[0].confidence * _AUTO_CONTENDER_RATIO
+    return any(c.confidence >= cutoff for c in candidates[1:])
 
 
 def _off_search_fallback(tag_result: TagResult) -> "Candidate | str":
@@ -654,14 +657,15 @@ async def _process_file(
             if mode == ConfirmationMode.OFF:
                 chosen = cands[0] if (is_high and cands) else "asis"
             elif mode == ConfirmationMode.AUTO and is_high and cands:
-                group = _top_twins(cands)
-                if len(group) == 1:
-                    chosen = group[0]
+                # Auto-import only a clearly-dominant top pick: no same-title twin
+                # AND no runner-up within 90% of its confidence. Otherwise prompt
+                # the full list (drop the recommendation to force the list layout).
+                if len(_top_twins(cands)) == 1 and not _has_close_contender(cands):
+                    chosen = cands[0]
                 else:
+                    tag_result.recommendation = Recommendation.none
                     chosen = await _confirm_looping(
-                        bot, tg_id, file_id, filename,
-                        TagResult(candidates=_reindexed(group), recommendation=Recommendation.none),
-                        file_path, states, report,
+                        bot, tg_id, file_id, filename, tag_result, file_path, states, report,
                     )
             else:
                 chosen = await _confirm_looping(

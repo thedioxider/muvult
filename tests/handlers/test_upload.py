@@ -8,6 +8,7 @@ from src.handlers.upload import (
     FileState,
     _find_existing_track,
     _top_twins,
+    _has_close_contender,
 )
 from src.library import album_owner_usernames, ensure_album_cover
 from src.models import Candidate, FileStatus
@@ -58,6 +59,33 @@ def test_top_twins_normalizes_title_punctuation():
         _c(2, "System of a Down", "Atwa", "live, Sportpaleis, Merksem"),
     ]
     assert [c.index for c in _top_twins(cands)] == [0, 1, 2]
+
+
+def test_has_close_contender_single_or_empty():
+    assert _has_close_contender([]) is False
+    assert _has_close_contender([_c(0, "A", "T", confidence=0.9)]) is False
+
+
+def test_has_close_contender_near_tie_triggers():
+    # runner-up 0.84 is >= 90% of 0.88 (cutoff 0.792) -> contender
+    cands = [_c(0, "A", "T0", confidence=0.88), _c(1, "A", "T1", confidence=0.84)]
+    assert _has_close_contender(cands) is True
+
+
+def test_has_close_contender_clear_gap_does_not():
+    # runner-up 0.70 is below 90% of 0.88 (cutoff 0.792) -> not a contender
+    cands = [_c(0, "A", "T0", confidence=0.88), _c(1, "A", "T1", confidence=0.70)]
+    assert _has_close_contender(cands) is False
+
+
+def test_has_close_contender_checks_any_runner_up():
+    # #1 is a clear gap but #2 sneaks back within range -> still a contender
+    cands = [
+        _c(0, "A", "T0", confidence=0.90),
+        _c(1, "A", "T1", confidence=0.60),
+        _c(2, "A", "T2", confidence=0.82),
+    ]
+    assert _has_close_contender(cands) is True
 
 
 def _req(candidates, page=0):
