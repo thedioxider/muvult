@@ -498,11 +498,9 @@ def test_apply_and_stage_sync_writes_recording_then_enriched(tmp_path):
     assert dest == dest_path
 
 
-def test_apply_and_stage_sync_appends_disambig_to_title(tmp_path):
-    # The recording disambiguation lives only in the pool path, so Navidrome shows a
-    # bare "Aerials" indistinguishable from the studio take. We append the full
-    # disambiguation to the title *tag*, while the pool destination is still computed
-    # from the untouched title.
+def test_apply_and_stage_sync_writes_disambig_to_subtitle(tmp_path):
+    # The recording disambiguation goes to the subtitle tag, leaving the title bare
+    # so scrobbles match the studio recording; the pool path is unaffected.
     audio = tmp_path / "song.mp3"
     audio.write_bytes(b"audio data")
     dest_path = tmp_path / ".pool" / "SOAD" / "Toxicity" / "Aerials (live, 2005-06-12).mp3"
@@ -511,11 +509,7 @@ def test_apply_and_stage_sync_appends_disambig_to_title(tmp_path):
     disambig = "live, 2005-06-12: Download Festival, Donington, England, UK"
     item.trackdisambig = disambig
 
-    title_at_dest = {}
-    def _dest():  # capture the title used to compute the pool path
-        title_at_dest["title"] = item.title
-        return str(dest_path)
-    item.destination.side_effect = _dest
+    item.destination.side_effect = lambda: str(dest_path)
 
     candidate = Candidate(
         index=0, artist="System of a Down", title="Aerials", album="",
@@ -527,17 +521,18 @@ def test_apply_and_stage_sync_appends_disambig_to_title(tmp_path):
         patch("src.beets_svc._get_recording_full", return_value=rec),
         patch("src.beets_svc._mb_plugin", return_value=plugin),
         patch("src.beets_svc._lib", MagicMock()),
+        patch("src.beets_svc._write_subtitle") as write_subtitle,
     ):
         staged, dest = _apply_and_stage_sync(audio, candidate, enrich=False)
 
-    assert title_at_dest["title"] == "Aerials"          # path uses the untouched title
-    assert item.title == f"Aerials ({disambig})"        # tag gets the full disambiguation
+    assert item.title == "Aerials"                      # title stays bare
+    write_subtitle.assert_called_once_with(audio, disambig)
     assert dest == dest_path
     item.write.assert_called_once_with(path=str(audio))
 
 
-def test_apply_and_stage_sync_no_disambig_leaves_title(tmp_path):
-    # A studio recording has no disambiguation -> the title tag is untouched.
+def test_apply_and_stage_sync_no_disambig_clears_subtitle(tmp_path):
+    # A studio recording has no disambiguation -> subtitle is cleared (empty), title bare.
     audio = tmp_path / "song.mp3"
     audio.write_bytes(b"audio data")
     dest_path = tmp_path / ".pool" / "SOAD" / "Toxicity" / "Aerials.mp3"
@@ -555,10 +550,12 @@ def test_apply_and_stage_sync_no_disambig_leaves_title(tmp_path):
         patch("src.beets_svc._get_recording_full", return_value=rec),
         patch("src.beets_svc._mb_plugin", return_value=plugin),
         patch("src.beets_svc._lib", MagicMock()),
+        patch("src.beets_svc._write_subtitle") as write_subtitle,
     ):
         _apply_and_stage_sync(audio, candidate, enrich=False)
 
     assert item.title == "Aerials"
+    write_subtitle.assert_called_once_with(audio, "")
 
 
 def test_apply_and_stage_sync_enriches_with_file_length_not_recording_length(tmp_path):

@@ -543,6 +543,18 @@ def _embed_cover_art(file_path: Path, rgid: str) -> None:
         log.debug("cover art embed failed for %s", file_path)
 
 
+def _write_subtitle(file_path: Path, subtitle: str) -> None:
+    """Set (or clear) the file's subtitle tag, best-effort."""
+    try:
+        from mediafile import MediaFile
+
+        mf = MediaFile(str(file_path))
+        mf.subtitle = subtitle or None
+        mf.save()
+    except Exception:
+        log.debug("subtitle write failed for %s", file_path)
+
+
 def _tag_acoustid(item: Item) -> None:
     """Stamp the file with its AcoustID id, if we fingerprinted it.
 
@@ -628,15 +640,13 @@ def _apply_and_stage_sync(
     # left with an entry pointing at the (transient) staging path. delete=False
     # keeps the file on disk.
     item.remove(delete=False)
-    # Surface the recording disambiguation in the title *tag* so tag-reading players
-    # (Navidrome) show e.g. "Aerials (live, 2005-06-12: Download Festival, ...)"
-    # instead of a bare "Aerials" that looks identical to the studio take. dest was
-    # already computed above from the untouched title. Idempotent on re-upload: the
-    # title is reset to the clean recording title by item.update before we append.
-    if disambig := (item.trackdisambig or "").strip():
-        item.title = f"{item.title} ({disambig})"
     _tag_acoustid(item)
     item.write(path=str(file_path))
+    # Recording disambiguation lives in the subtitle tag: Navidrome shows it and keys
+    # ND_PID_TRACK (albumartistid,title,subtitle) on it, so a distinct recording of
+    # the same track stays distinct while the title stays bare and scrobbles match.
+    # Always set/cleared so a re-tag never leaves a stale subtitle.
+    _write_subtitle(file_path, (item.trackdisambig or "").strip())
     # Cover art rides on album identity: embed the release group's front image so a
     # symlinked pool (no per-album folder to drop a cover in) still shows art.
     if enriched and (rgid := enriched.get("mb_releasegroupid")):
