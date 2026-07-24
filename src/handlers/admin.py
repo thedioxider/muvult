@@ -402,6 +402,12 @@ async def cmd_removetrack(message: Message) -> None:
 _pending_retags: dict[str, dict[str, Any]] = {}
 
 
+def _is_retaggable(track: Track) -> bool:
+    """Every pool track is re-taggable except as-is (unmatched) user imports, which
+    carry no MB metadata to refresh."""
+    return not track.is_asis
+
+
 def _album_rgid(album_dir: Path) -> str | None:
     """Release-group id read from any audio file in an album dir."""
     try:
@@ -416,12 +422,13 @@ def _album_rgid(album_dir: Path) -> str | None:
 
 async def _resolve_retag_scope(raw: str | None):
     """``(track_ids, cover_dirs, track_albums)`` for a /retag arg, or ``None`` if the
-    wildcard is invalid. Re-taggable rows carry a ``musicbrainz_id``; ``cover_dirs``
-    (empty => no refetch) are albums whose folder cover to refresh; ``track_albums``
-    drives the confirm gate. No arg -> whole library; ``prefix/*`` -> that subtree;
-    a bare ``front.<ext>`` -> that album's cover only; else an exact track path."""
+    wildcard is invalid. Re-taggable rows are every pool track except as-is user
+    imports (``_is_retaggable``); ``cover_dirs`` (empty => no refetch) are albums
+    whose folder cover to refresh; ``track_albums`` drives the confirm gate. No arg
+    -> whole library; ``prefix/*`` -> that subtree; a bare ``front.<ext>`` -> that
+    album's cover only; else an exact track path."""
     async with get_session() as session:
-        rows = [t for t in (await session.exec(select(Track))).all() if t.musicbrainz_id]
+        rows = [t for t in (await session.exec(select(Track))).all() if _is_retaggable(t)]
     if raw is None:
         tracks, refetch = rows, True
     elif raw.endswith("/*"):

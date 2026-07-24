@@ -163,7 +163,8 @@ async def _seed_retag_tracks():
         s.add(Track(id=1, pool_path="Ar/Al1/a.mp3", musicbrainz_id="m1", format="flac", bitrate=1000))
         s.add(Track(id=2, pool_path="Ar/Al1/b.mp3", musicbrainz_id="m2", format="flac", bitrate=1000))
         s.add(Track(id=3, pool_path="Ar/Al2/c.mp3", musicbrainz_id="m3", format="flac", bitrate=1000))
-        s.add(Track(id=4, pool_path="Ar/Al2/d.mp3", musicbrainz_id=None, format="mp3", bitrate=320))
+        # As-is import: excluded from re-tagging via is_asis, regardless of its path.
+        s.add(Track(id=4, pool_path="Ar/Al2/d.mp3", musicbrainz_id=None, is_asis=True, format="mp3", bitrate=320))
         await s.commit()
 
 
@@ -172,7 +173,7 @@ async def test_resolve_retag_scope_variants(tmp_path):
     await init_db(str(tmp_path / "db"))
     await _seed_retag_tracks()
 
-    # No arg -> whole library (only tagged rows); covers every touched album.
+    # No arg -> whole library except as-is imports; covers every touched album.
     ids, covers, albums = await _resolve_retag_scope(None)
     assert set(ids) == {1, 2, 3}
     assert covers == {"Ar/Al1", "Ar/Al2"} == albums
@@ -181,7 +182,7 @@ async def test_resolve_retag_scope_variants(tmp_path):
     ids, covers, albums = await _resolve_retag_scope("Ar/Al1/*")
     assert set(ids) == {1, 2} and covers == {"Ar/Al1"} == albums
 
-    # untagged rows are excluded even under a matching prefix.
+    # As-is imports are excluded even under a matching prefix.
     ids, _, _ = await _resolve_retag_scope("Ar/Al2/*")
     assert set(ids) == {3}
 

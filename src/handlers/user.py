@@ -6,6 +6,7 @@ from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, C
 from sqlmodel import select
 
 from ..db import User, get_session
+from ..models import DEFAULT_SETTINGS
 from ..tg_utils import safe_answer
 
 user_router = Router()
@@ -89,33 +90,70 @@ async def cmd_settings(message: Message) -> None:
         return
 
     s = json.loads(row.settings)
-    current = s.get("confirmation", "auto")
-    enrich = s.get("enrich", True)
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [
+    do_tag = s.get("tag", DEFAULT_SETTINGS["tag"])
+    current = s.get("confirmation", DEFAULT_SETTINGS["confirmation"])
+    enrich = s.get("enrich", DEFAULT_SETTINGS["enrich"])
+    rows = [[
+        InlineKeyboardButton(
+            text=f"{'✓ ' if do_tag == v else ''}tagging {'on' if v else 'off'}",
+            callback_data=f"set_tag:{'on' if v else 'off'}",
+        )
+        for v in (False, True)
+    ]]
+    text = (
+        "Track tagging (match each file against MusicBrainz):\n"
+        "  — off: import everything as-is, no lookups\n"
+        "  — on: identify and tag tracks"
+    )
+    # Confirmation and album metadata only apply when tagging is on -- hide them
+    # otherwise so neither can be set without tagging.
+    if do_tag:
+        rows.append([
             InlineKeyboardButton(
                 text=f"{'✓ ' if current == m else ''}{m}", callback_data=f"set_conf:{m}"
             )
             for m in ("off", "auto", "on")
-        ],
-        [
+        ])
+        rows.append([
             InlineKeyboardButton(
                 text=f"{'✓ ' if enrich == v else ''}album metadata {'on' if v else 'off'}",
                 callback_data=f"set_enrich:{'on' if v else 'off'}",
             )
             for v in (False, True)
-        ],
-    ])
-    await message.answer(
-        "Confirmation mode for metadata search:\n"
-        "  — off: don't ask anything\n"
-        "  — auto: ask only when no exact matches found\n"
-        "  — on: ask even if exact match is found\n\n"
-        "Album metadata fetch (album, track number, disc, year, cover art):\n"
-        "  — off: faster, tags title and artist only\n"
-        "  — on: slower, adds a MusicBrainz lookup per track",
-        reply_markup=keyboard
-    )
+        ])
+        text += (
+            "\n\nConfirmation mode for metadata search:\n"
+            "  — off: don't ask anything\n"
+            "  — auto: ask only when no exact matches found\n"
+            "  — on: ask even if exact match is found\n\n"
+            "Album metadata fetch (album, track number, disc, year, cover art):\n"
+            "  — off: faster, tags title and artist only\n"
+            "  — on: slower, adds a MusicBrainz lookup per track"
+        )
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@user_router.callback_query(lambda c: c.data and c.data.startswith("set_tag:"))
+async def cb_set_tag(callback: CallbackQuery) -> None:
+    choice = callback.data.split(":")[1]
+    if choice not in ("on", "off"):
+        await safe_answer(callback, "Invalid option")
+        return
+
+    tg_id = callback.from_user.id
+    async with get_session() as session:
+        result = await session.exec(select(User).where(User.tg_id == tg_id))
+        row = result.first()
+        if not row:
+            await safe_answer(callback, "Not found")
+            return
+        s = json.loads(row.settings)
+        s["tag"] = choice == "on"
+        row.settings = json.dumps(s)
+        await session.commit()
+
+    await callback.message.edit_text(f"Track tagging: <b>{choice}</b>", parse_mode="HTML")
+    await safe_answer(callback)
 
 
 @user_router.callback_query(lambda c: c.data and c.data.startswith("set_conf:"))

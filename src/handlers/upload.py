@@ -17,7 +17,7 @@ from beets.autotag.match import Recommendation
 from ..beets_svc import get_candidates, apply_and_stage, stage_as_is, normalize_title
 from ..db import Track, TrackOwnership, User, get_session
 from ..library import ensure_album_cover, promote_and_relink
-from ..models import Candidate, ConfirmationMode, FileStatus, TagResult
+from ..models import Candidate, ConfirmationMode, DEFAULT_SETTINGS, FileStatus, TagResult
 from ..pool import (
     create_symlink,
     pool_rel,
@@ -623,64 +623,70 @@ async def _process_file(
             await bot.download(file_id, destination=file_path)
         log.info("received %r (tg_id=%s, %d bytes)", filename, tg_id, file_path.stat().st_size)
 
-        states[file_id].status = FileStatus.TAGGING
-        await report()
-        tag_result = await get_candidates(file_path)
-        log.info(
-            "tagged %r: %s, %d candidate(s)", filename,
-            "fingerprint" if tag_result.fingerprinted
-            else "search" if tag_result.candidates else "no match",
-            len(tag_result.candidates),
-        )
-
+        # Load settings before tagging so the master switch can skip it entirely.
         async with get_session() as session:
             result = await session.exec(select(User).where(User.tg_id == tg_id))
             db_user = result.first()
         user_settings = json.loads(db_user.settings) if db_user else {}
-        mode = ConfirmationMode(user_settings.get("confirmation", "auto"))
-        enrich = user_settings.get("enrich", True)
+        do_tag = user_settings.get("tag", DEFAULT_SETTINGS["tag"])
+        mode = ConfirmationMode(user_settings.get("confirmation", DEFAULT_SETTINGS["confirmation"]))
+        enrich = user_settings.get("enrich", DEFAULT_SETTINGS["enrich"])
 
-        cands = tag_result.candidates
         # chosen is a Candidate (import it), "asis", or None (skip).
         chosen: "Candidate | str | None" = None
 
-        if tag_result.fingerprinted:
-            top = cands[0].confidence if cands else 0.0
-            passes = top >= _FP_CONFIDENCE_THRESHOLD
-            if mode == ConfirmationMode.OFF:
-                # Trust a confident fingerprint outright; below the bar fall back to
-                # beets' text search rather than picking a weak audio match.
-                chosen = cands[0] if passes else _off_search_fallback(tag_result)
-            elif mode == ConfirmationMode.AUTO and passes and _is_dominant_top(cands):
-                # Confident top fingerprint that's clearly dominant: import silently.
-                chosen = cands[0]
-            else:
-                # AUTO below the bar or ambiguous (twin / close contender), and ON:
-                # prompt the fingerprint set (a "Show all results" button reveals the text net).
-                chosen = await _confirm_looping(
-                    bot, tg_id, file_id, filename, tag_result, file_path, states, report
-                )
+        if not do_tag:
+            # Master switch off: import every file as-is, no MusicBrainz lookup.
+            chosen = "asis"
         else:
-            # Text-search path, unchanged in spirit: OFF imports #0 when beets
-            # recommends strongly (else as-is); AUTO auto-imports a unique top pick
-            # but prompts among same-title twins; ON always prompts.
-            is_high = tag_result.recommendation >= Recommendation.strong
-            if mode == ConfirmationMode.OFF:
-                chosen = cands[0] if (is_high and cands) else "asis"
-            elif mode == ConfirmationMode.AUTO and is_high and cands:
-                # Auto-import only a clearly-dominant top pick; otherwise prompt the
-                # full list (drop the recommendation to force the list layout).
-                if _is_dominant_top(cands):
+            states[file_id].status = FileStatus.TAGGING
+            await report()
+            tag_result = await get_candidates(file_path)
+            log.info(
+                "tagged %r: %s, %d candidate(s)", filename,
+                "fingerprint" if tag_result.fingerprinted
+                else "search" if tag_result.candidates else "no match",
+                len(tag_result.candidates),
+            )
+            cands = tag_result.candidates
+
+            if tag_result.fingerprinted:
+                top = cands[0].confidence if cands else 0.0
+                passes = top >= _FP_CONFIDENCE_THRESHOLD
+                if mode == ConfirmationMode.OFF:
+                    # Trust a confident fingerprint outright; below the bar fall back to
+                    # beets' text search rather than picking a weak audio match.
+                    chosen = cands[0] if passes else _off_search_fallback(tag_result)
+                elif mode == ConfirmationMode.AUTO and passes and _is_dominant_top(cands):
+                    # Confident top fingerprint that's clearly dominant: import silently.
                     chosen = cands[0]
                 else:
-                    tag_result.recommendation = Recommendation.none
+                    # AUTO below the bar or ambiguous (twin / close contender), and ON:
+                    # prompt the fingerprint set (a "Show all results" button reveals the text net).
                     chosen = await _confirm_looping(
-                        bot, tg_id, file_id, filename, tag_result, file_path, states, report,
+                        bot, tg_id, file_id, filename, tag_result, file_path, states, report
                     )
             else:
-                chosen = await _confirm_looping(
-                    bot, tg_id, file_id, filename, tag_result, file_path, states, report
-                )
+                # Text-search path, unchanged in spirit: OFF imports #0 when beets
+                # recommends strongly (else as-is); AUTO auto-imports a unique top pick
+                # but prompts among same-title twins; ON always prompts.
+                is_high = tag_result.recommendation >= Recommendation.strong
+                if mode == ConfirmationMode.OFF:
+                    chosen = cands[0] if (is_high and cands) else "asis"
+                elif mode == ConfirmationMode.AUTO and is_high and cands:
+                    # Auto-import only a clearly-dominant top pick; otherwise prompt the
+                    # full list (drop the recommendation to force the list layout).
+                    if _is_dominant_top(cands):
+                        chosen = cands[0]
+                    else:
+                        tag_result.recommendation = Recommendation.none
+                        chosen = await _confirm_looping(
+                            bot, tg_id, file_id, filename, tag_result, file_path, states, report,
+                        )
+                else:
+                    chosen = await _confirm_looping(
+                        bot, tg_id, file_id, filename, tag_result, file_path, states, report
+                    )
 
         if chosen is None:
             states[file_id] = FileState(filename, FileStatus.SKIPPED)
