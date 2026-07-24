@@ -6,6 +6,7 @@ from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, C
 from sqlmodel import select
 
 from ..db import User, get_session
+from ..models import DEFAULT_SETTINGS
 from ..tg_utils import safe_answer
 
 user_router = Router()
@@ -89,8 +90,8 @@ async def cmd_settings(message: Message) -> None:
         return
 
     s = json.loads(row.settings)
-    current = s.get("confirmation", "auto")
-    enrich = s.get("enrich", True)
+    current = s.get("confirmation", DEFAULT_SETTINGS["confirmation"])
+    enrich = s.get("enrich", DEFAULT_SETTINGS["enrich"])
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(

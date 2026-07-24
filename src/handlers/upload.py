@@ -17,7 +17,7 @@ from beets.autotag.match import Recommendation
 from ..beets_svc import get_candidates, apply_and_stage, stage_as_is, normalize_title
 from ..db import Track, TrackOwnership, User, get_session
 from ..library import ensure_album_cover, promote_and_relink
-from ..models import Candidate, ConfirmationMode, FileStatus, TagResult
+from ..models import Candidate, ConfirmationMode, DEFAULT_SETTINGS, FileStatus, TagResult
 from ..pool import (
     create_symlink,
     pool_rel,
@@ -637,8 +637,8 @@ async def _process_file(
             result = await session.exec(select(User).where(User.tg_id == tg_id))
             db_user = result.first()
         user_settings = json.loads(db_user.settings) if db_user else {}
-        mode = ConfirmationMode(user_settings.get("confirmation", "auto"))
-        enrich = user_settings.get("enrich", True)
+        mode = ConfirmationMode(user_settings.get("confirmation", DEFAULT_SETTINGS["confirmation"]))
+        enrich = user_settings.get("enrich", DEFAULT_SETTINGS["enrich"])
 
         cands = tag_result.candidates
         # chosen is a Candidate (import it), "asis", or None (skip).
