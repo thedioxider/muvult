@@ -90,9 +90,17 @@ async def cmd_settings(message: Message) -> None:
         return
 
     s = json.loads(row.settings)
+    do_tag = s.get("tag", DEFAULT_SETTINGS["tag"])
     current = s.get("confirmation", DEFAULT_SETTINGS["confirmation"])
     enrich = s.get("enrich", DEFAULT_SETTINGS["enrich"])
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text=f"{'✓ ' if do_tag == v else ''}tagging {'on' if v else 'off'}",
+                callback_data=f"set_tag:{'on' if v else 'off'}",
+            )
+            for v in (False, True)
+        ],
         [
             InlineKeyboardButton(
                 text=f"{'✓ ' if current == m else ''}{m}", callback_data=f"set_conf:{m}"
@@ -108,6 +116,9 @@ async def cmd_settings(message: Message) -> None:
         ],
     ])
     await message.answer(
+        "Track tagging (match each file against MusicBrainz):\n"
+        "  — off: import everything as-is, no lookups\n"
+        "  — on: identify and tag tracks (confirmation + album metadata below apply)\n\n"
         "Confirmation mode for metadata search:\n"
         "  — off: don't ask anything\n"
         "  — auto: ask only when no exact matches found\n"
@@ -117,6 +128,29 @@ async def cmd_settings(message: Message) -> None:
         "  — on: slower, adds a MusicBrainz lookup per track",
         reply_markup=keyboard
     )
+
+
+@user_router.callback_query(lambda c: c.data and c.data.startswith("set_tag:"))
+async def cb_set_tag(callback: CallbackQuery) -> None:
+    choice = callback.data.split(":")[1]
+    if choice not in ("on", "off"):
+        await safe_answer(callback, "Invalid option")
+        return
+
+    tg_id = callback.from_user.id
+    async with get_session() as session:
+        result = await session.exec(select(User).where(User.tg_id == tg_id))
+        row = result.first()
+        if not row:
+            await safe_answer(callback, "Not found")
+            return
+        s = json.loads(row.settings)
+        s["tag"] = choice == "on"
+        row.settings = json.dumps(s)
+        await session.commit()
+
+    await callback.message.edit_text(f"Track tagging: <b>{choice}</b>", parse_mode="HTML")
+    await safe_answer(callback)
 
 
 @user_router.callback_query(lambda c: c.data and c.data.startswith("set_conf:"))

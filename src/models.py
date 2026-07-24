@@ -18,8 +18,11 @@ class ConfirmationMode(str, Enum):
 # is defined here so the /settings UI and the upload path never drift -- read a
 # setting as ``settings.get(key, DEFAULT_SETTINGS[key])`` everywhere.
 DEFAULT_SETTINGS: dict[str, Any] = {
+    # Master switch: tag tracks against MusicBrainz. Off imports every file as-is.
+    "tag": True,
     "confirmation": ConfirmationMode.AUTO.value,  # "auto"
-    "enrich": True,
+    # Album-level enrichment (album, track number, disc, year, cover art).
+    "enrich": False,
 }
 
 
